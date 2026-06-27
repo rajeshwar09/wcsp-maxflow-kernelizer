@@ -1,5 +1,5 @@
-#ifndef WMK_MAXFLOW_STATIC_H
-#define WMK_MAXFLOW_STATIC_H
+#ifndef MAXFLOW_MAXFLOW_STATIC_H
+#define MAXFLOW_MAXFLOW_STATIC_H
 
 #include <vector>
 #include <queue>
@@ -8,7 +8,7 @@
 
 #include "src/cpu/graph_csr.h"
 
-namespace wmk {
+namespace maxflow {
   
   // Static max-flow on the CPU (paper's algorithms)
   // cap_t is the capacity/flow number type (template parameter)
@@ -179,7 +179,7 @@ namespace wmk {
       }
   };
 
-} // namespace wmk
+} // namespace maxflow
 
 
-#endif // WMK_MAXFLOW_STATIC_H
+#endif // MAXFLOW_MAXFLOW_STATIC_H

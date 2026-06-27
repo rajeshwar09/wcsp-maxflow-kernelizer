@@ -1,11 +1,11 @@
-#ifndef WMK_TYPES_H
-#define WMK_TYPES_H
+#ifndef MAXFLOW_TYPES_H
+#define MAXFLOW_TYPES_H
 
 // Common small type aliases used across project.
 // Capacities/flows are kept as a TEMPLATE parameter (cap_t) on data structures and algorithms
 // current = int, later with CCG = float/double
 
-namespace wmk { // wcsp-maxflow-kernelizer
+namespace maxflow {
   
   // vertex is just an index into the node arrays
   using vertex_id_t = int;
@@ -15,4 +15,4 @@ namespace wmk { // wcsp-maxflow-kernelizer
 
 } // namespace wmk
 
-#endif // WMK_TYPES_H
+#endif // MAXFLOW_TYPES_H

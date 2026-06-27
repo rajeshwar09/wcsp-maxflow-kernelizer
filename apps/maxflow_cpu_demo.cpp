@@ -14,9 +14,9 @@ int main(int argc, char const *argv[]) {
 
   using cap_t = long long;
 
-  wmk::flow_network<cap_t> net = wmk::read_dimacs_maxflow<cap_t>(argv[1]);
+  maxflow::flow_network<cap_t> net = maxflow::read_dimacs_maxflow<cap_t>(argv[1]);
   
-  wmk::static_max_flow_solver<cap_t> solver(net);
+  maxflow::static_max_flow_solver<cap_t> solver(net);
     cap_t flow = solver.solve();
 
     std::cout << "max-flow (source " << net.source
@@ -24,7 +24,7 @@ int main(int argc, char const *argv[]) {
 
     std::cout << "min-cut source side {";
     bool first = true;
-    for (wmk::vertex_id_t v = 0; v < net.num_nodes; ++v)
+    for (maxflow::vertex_id_t v = 0; v < net.num_nodes; ++v)
       if (solver.is_on_source_side(v)) {
         std::cout << (first ? "" : ", ") << v;
         first = false;

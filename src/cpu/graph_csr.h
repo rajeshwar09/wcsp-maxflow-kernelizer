@@ -1,5 +1,5 @@
-#ifndef WMK_GRAPH_CSR_H
-#define WMK_GRAPH_CSR_H
+#ifndef MAXFLOW_GRAPH_CSR_H
+#define MAXFLOW_GRAPH_CSR_H
 
 #include <vector>
 #include <cstddef>
@@ -7,7 +7,7 @@
 
 #include "src/common/types.h"
 
-namespace wmk {
+namespace maxflow {
   
   // Single directed edge from input: u -> v with capacity cap
   template<typename cap_t>
@@ -141,7 +141,7 @@ namespace wmk {
       }
   };
 
-} // namespace wmk
+} // namespace maxflow
 
 
-#endif // WMK_GRAPH_CSR_H
+#endif // MAXFLOW_GRAPH_CSR_H

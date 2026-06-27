@@ -1,5 +1,5 @@
-#ifndef WMK_DIMACS_READER_H
-#define WMK_DIMACS_READER_H
+#ifndef MAXFLOW_DIMACS_READER_H
+#define MAXFLOW_DIMACS_READER_H
 
 #include <fstream>
 #include <sstream>
@@ -9,7 +9,7 @@
 
 #include "src/cpu/graph_csr.h"
 
-namespace wmk {
+namespace maxflow {
   
   // Read flow network in DIMACS max-flow format and fill flow_network<cap_t>
   // Format (1-index based) : 
@@ -70,6 +70,6 @@ namespace wmk {
   }
 
 
-} // namespace wmk
+} // namespace maxflow
 
-#endif // WMK_DIMACS_READER_H
+#endif // MAXFLOW_DIMACS_READER_H
