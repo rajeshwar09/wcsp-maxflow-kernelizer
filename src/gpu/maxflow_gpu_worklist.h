@@ -17,6 +17,14 @@
 
 namespace maxflow {
   
+  // Reset all per-vertex flags to 0 before each worklist round
+  __global__ void worklist_reset_flags_kernel(int num_nodes, int* in_worklist) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < num_nodes) {
+      in_worklist[tid] = 0;
+    }
+  }
+
   //  Build initial worklist: scan all vertices, colelct active ones
   //  Active = not s/t, excess > 0, height < |V|
   __global__ void worklist_build_kernel(int num_nodes, int source, int sink, const int* excess, const int* height, int* worklist, int* wl_count) {
@@ -37,7 +45,7 @@ namespace maxflow {
   //  vertex is appended to worklist_out and host can schedule more round without full global relabel
   __global__ void worklist_push_relabel_kernel(
     int wl_size, int num_nodes, int source, int sink, int kernel_cycles, const int* worklist_in, const int* offset, const int* edge_dst, 
-    int* residual_capacity, const int* reverse_index, int* excess, int* height, int* worklist_out, int* wl_out_count) {
+    int* residual_capacity, const int* reverse_index, int* excess, int* height, int* worklist_out, int* wl_out_count, int* in_worklist) {
       
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= wl_size) {
@@ -79,8 +87,10 @@ namespace maxflow {
 
         //  v_hat may now be active => add it to output worklist
         if (v_hat != source && v_hat != sink) {
-          int pos = atomicAdd(wl_out_count, 1);
-          worklist_out[pos] = v_hat;
+          if (atomicCAS(&in_worklist[v_hat], 0, 1) == 0) {
+            int pos = atomicAdd(wl_out_count, 1);
+            worklist_out[pos] = v_hat;
+          }
         }
       } else {
         //  Relabel
@@ -90,8 +100,10 @@ namespace maxflow {
 
     //  If u still active after kernel_cycles then add it back to output worklist
     if (excess[u] > 0 && height[u] < num_nodes) {
-      int pos = atomicAdd(wl_out_count, 1);
-      worklist_out[pos] = u;
+      if (atomicCAS(&in_worklist[u], 0, 1) == 0) {
+        int pos = atomicAdd(wl_out_count, 1);
+        worklist_out[pos] = u;
+      }
     }
   }
 
@@ -123,6 +135,9 @@ namespace maxflow {
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_wl_in_count, sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_wl_out_count, sizeof(int)));
 
+        // Per-vertex dedup flag array (prevents duplicates in worklist)
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_in_worklist, V * sizeof(int)));
+
         //  Copy graph structure to device
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_offset, net.offset.data(), (V + 1) * sizeof(int), cudaMemcpyHostToDevice));
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_edge_dst, net.edge_dst.data(), E * sizeof(int), cudaMemcpyHostToDevice));
@@ -143,6 +158,7 @@ namespace maxflow {
         cudaFree(d_worklist_out);
         cudaFree(d_wl_in_count);
         cudaFree(d_wl_out_count);
+        cudaFree(d_in_worklist);
       }
 
       gpu_worklist_solver(const gpu_worklist_solver&) = delete;
@@ -220,12 +236,13 @@ namespace maxflow {
           //  Inner worklist loop
           //  Multiple push-relabel without redoing global relabel
           while (wl_size > 0) {
-            // Reset output count
+            // Reset output count and dup flags
+            worklist_reset_flags_kernel<<<blocks_v, threads>>>(V, d_in_worklist);
             h_val = 0;
             MAXFLOW_CUDA_CHECK(cudaMemcpy(d_wl_out_count, &h_val, sizeof(int), cudaMemcpyHostToDevice));
 
             int blocks_wl = (wl_size + threads - 1) / threads;
-            worklist_push_relabel_kernel<<<blocks_wl, threads>>>(wl_size, V, net.source, net.sink, kernel_cycles, d_worklist_in, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, d_worklist_out, d_wl_out_count);
+            worklist_push_relabel_kernel<<<blocks_wl, threads>>>(wl_size, V, net.source, net.sink, kernel_cycles, d_worklist_in, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, d_worklist_out, d_wl_out_count, d_in_worklist);
             MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 
             // Read output worklist size
@@ -272,6 +289,9 @@ namespace maxflow {
       int* d_worklist_out = nullptr; // newly active vertices for next round
       int* d_wl_in_count = nullptr;  // number of entries in worklist_in
       int* d_wl_out_count = nullptr; // atomic counter for worklist_out
+
+      // Per-vertex dedup flag (prevents duplicate worklist entries)
+      int* d_in_worklist  = nullptr;
 
       //  Host copy of heights
       std::vector<int> h_height;
