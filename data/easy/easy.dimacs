@@ -1,0 +1,9 @@
+c Easy flow network: 4 nodes, expected max-flow = 5
+p max 4 5
+n 1 s
+n 4 t
+a 1 2 3
+a 1 3 2
+a 2 3 1
+a 2 4 2
+a 3 4 3
