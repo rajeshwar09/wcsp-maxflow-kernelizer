@@ -132,7 +132,10 @@ namespace maxflow {
 
       if (height[u] > lowest_h) {
         //  Push: send min(excess[u], residual[e_hat]) along e_hat
-        int d = std::min(excess[u], residual_capacity[e_hat]);
+        // int d = min(excess[u], residual_capacity[e_hat]);
+        int a = excess[u];
+        int b = residual_capacity[e_hat];
+        int d = (a < b) ? a : b;
         atomicAdd(&residual_capacity[e_hat], -d);
         atomicAdd(&residual_capacity[reverse_index[e_hat]], d);
         atomicAdd(&excess[u], -d);
