@@ -62,6 +62,7 @@ namespace maxflow {
         }
         std::fill(excess.begin(), excess.end(), cap_t(0));
         std::fill(height.begin(), height.end(), 0);
+        height[net.source] = net.num_nodes;
       }
       
       // Algorithm 1
