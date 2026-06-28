@@ -1,21 +1,20 @@
 #ifndef MAXFLOW_GPU_WORKLIST_H
 #define MAXFLOW_GPU_WORKLIST_H
 
-#include "src/gpu/maxflow_gpu_topology.h"
-
-//  Reusing following kernels from topology file
-//   topo_initialize_kernel
-//   topo_saturate_source_kernel
-//   topo_bfs_init_kernel
-//   topo_bfs_step_kernel
-//   topo_remove_invalid_edges_kernel
-//   topo_check_active_kernel
-//
-// It adds two new kernels for the data-driven worklist:
-//   worklist_build_kernel - scan vertices, collect active into worklist
-//   worklist_push_relabel_kernel - process only worklist vertices
+#include "src/gpu/maxflow_gpu_common.h"
 
 namespace maxflow {
+
+  //  ------------------------------------------------------------------------------------
+  //  Data-driven Worklist approach
+  //
+  // It adds two new kernels for the data-driven worklist:
+  //   worklist_build_kernel - scan vertices, collect active into worklist
+  //   worklist_push_relabel_kernel - process only worklist vertices
+  //  Shared kernels: (init, saturate, BFS, remove-invalid, check-active)
+  //  taken from "maxflow_gpu_common.h"
+  //  ------------------------------------------------------------------------------------
+
   
   // Reset all per-vertex flags to 0 before each worklist round
   __global__ void worklist_reset_flags_kernel(int num_nodes, int* in_worklist) {
@@ -39,7 +38,7 @@ namespace maxflow {
     }
   }
 
-  //  Push-relabel on worklist vertices only
+  //  Algorithm 2: Push-relabel on worklist vertices only
   //  Each thread processes one vertex from worklist_in
   //  Push activates a neighbour or relabel/residual-excess keep vertex active,
   //  vertex is appended to worklist_out and host can schedule more round without full global relabel
@@ -109,7 +108,7 @@ namespace maxflow {
 
   //  Host Solver Class - Data Worklist
   //
-  //  Same outer loop as topology. push-relabel phase urn an inner worlist loop
+  //  Same outer loop as topology. push-relabel phase turn an inner worlist loop
   //  Only active vertices feed the next round (no full global relabel)
 
   class gpu_worklist_solver {
@@ -177,7 +176,7 @@ namespace maxflow {
         int h_val;
 
         //  Algorithm 1 : initialize
-        topo_initialize_kernel<<<blocks_v, threads>>>(V, E, net.source, d_capacity, d_residual_capacity, d_excess, d_height);
+        gpu_initialize_kernel<<<blocks_v, threads>>>(V, E, net.source, d_capacity, d_residual_capacity, d_excess, d_height);
         MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 
         //  Algorithm 1 : saturate source
@@ -186,7 +185,7 @@ namespace maxflow {
         int src_count = src_end - src_start;
         if (src_count > 0) {
           int blocks_s = (src_count + threads - 1) / threads;
-          topo_saturate_source_kernel<<<blocks_s, threads>>>(src_start, src_end, net.source, d_edge_dst, d_capacity, d_residual_capacity, d_reverse_index, d_excess);
+          gpu_saturate_source_kernel<<<blocks_s, threads>>>(src_start, src_end, net.source, d_edge_dst, d_capacity, d_residual_capacity, d_reverse_index, d_excess);
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
         }
 
@@ -196,7 +195,7 @@ namespace maxflow {
           h_val = 0;
           MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_val, sizeof(int), cudaMemcpyHostToDevice));
 
-          topo_check_active_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_excess, d_height, d_flag);
+          gpu_check_active_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_excess, d_height, d_flag);
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
           
           MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_val, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
@@ -206,14 +205,14 @@ namespace maxflow {
           }
 
           //  Algorithm 4 : global relabel
-          topo_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
+          gpu_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 
           for (int level = 0; level < V; level++) {
             h_val = 0;
             MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_val, sizeof(int), cudaMemcpyHostToDevice));
             
-            topo_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
+            gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
             MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
             
             MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_val, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
@@ -253,7 +252,7 @@ namespace maxflow {
           }
 
           //  Algorithm 3 : remove invalid edges
-          topo_remove_invalid_edges_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+          gpu_remove_invalid_edges_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
         }
 
