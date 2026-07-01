@@ -6,6 +6,9 @@
 // current = int, later with CCG = float/double
 
 namespace maxflow {
+
+  // project-wide capacity/flow type
+  using cap_t = double;
   
   // vertex is just an index into the node arrays
   using vertex_id_t = int;
@@ -13,6 +16,6 @@ namespace maxflow {
   // half-edge is just an index into the edge arrays
   using edge_id_t = int;
 
-} // namespace wmk
+} // namespace maxflow
 
 #endif // MAXFLOW_TYPES_H
