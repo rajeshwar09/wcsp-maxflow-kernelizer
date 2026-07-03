@@ -16,14 +16,14 @@ namespace maxflow {
   //  Algorithm 2: Push-relabel sweep
   //  Each thread does upto kernel_cycles times
   //  Reference: staticMaxFlow_kernel_14
-  __global__ void topo_push_relabel_kernel(int num_nodes, int source, int sink, int kernel_cycles, const int* offset, const int* edge_dst, int* residual_capacity, const int* reverse_index, int* excess, int* height) {
+  __global__ void topo_push_relabel_kernel(int num_nodes, int source, int sink, int kernel_cycles, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height) {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     if (u >= num_nodes || u == source || u == sink) {
       return;
     }
 
     for (int cnt = 0; cnt < kernel_cycles; cnt++) {
-      if (!(height[u] < num_nodes && excess[u] > 0)) {
+      if (!(height[u] < num_nodes && excess[u] > cap_t(0))) {
         break;  // u not active
       }
       
@@ -33,7 +33,7 @@ namespace maxflow {
       int e_hat = -1;
 
       for (int e = offset[u]; e < offset[u + 1]; e++) {
-        if (residual_capacity[e] > 0 && height[edge_dst[e]] < lowest_h) {
+        if (residual_capacity[e] > cap_t(0) && height[edge_dst[e]] < lowest_h) {
           lowest_h = height[edge_dst[e]];
           v_hat = edge_dst[e];
           e_hat = e;
@@ -47,9 +47,9 @@ namespace maxflow {
       if (height[u] > lowest_h) {
         //  Push: send min(excess[u], residual[e_hat]) along e_hat
         // int d = min(excess[u], residual_capacity[e_hat]);
-        int a = excess[u];
-        int b = residual_capacity[e_hat];
-        int d = (a < b) ? a : b;
+        cap_t a = excess[u];
+        cap_t b = residual_capacity[e_hat];
+        cap_t d = (a < b) ? a : b;
         atomicAdd(&residual_capacity[e_hat], -d);
         atomicAdd(&residual_capacity[reverse_index[e_hat]], d);
         atomicAdd(&excess[u], -d);
@@ -67,24 +67,24 @@ namespace maxflow {
   //  Copies result back to host
   class gpu_topology_solver {
     public:
-      explicit gpu_topology_solver(flow_network<int>& net): net(net) {
+      explicit gpu_topology_solver(flow_network<cap_t>& net): net(net) {
         int V = net.num_nodes;
         int E = net.num_edges;
 
         //  Allocate device arrays
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_offset,            (V + 1) * sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_edge_dst,          E       * sizeof(int)));
-        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_capacity,          E       * sizeof(int)));
-        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_residual_capacity, E       * sizeof(int)));
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_capacity,          E       * sizeof(cap_t)));
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_residual_capacity, E       * sizeof(cap_t)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_reverse_index,     E       * sizeof(int)));
-        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_excess,            V       * sizeof(int)));
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_excess,            V       * sizeof(cap_t)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_height,            V       * sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_flag,              1       * sizeof(int)));
 
         //  Copy graph struct to device
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_offset, net.offset.data(), (V + 1) * sizeof(int), cudaMemcpyHostToDevice));
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_edge_dst, net.edge_dst.data(), E * sizeof(int), cudaMemcpyHostToDevice));
-        MAXFLOW_CUDA_CHECK(cudaMemcpy(d_capacity, net.capacity.data(), E * sizeof(int), cudaMemcpyHostToDevice));
+        MAXFLOW_CUDA_CHECK(cudaMemcpy(d_capacity, net.capacity.data(), E * sizeof(cap_t), cudaMemcpyHostToDevice));
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_reverse_index, net.reverse_index.data(), E * sizeof(int), cudaMemcpyHostToDevice));
       }
 
@@ -101,10 +101,10 @@ namespace maxflow {
 
       //  Disallow copy (raw pointers)
       gpu_topology_solver(const gpu_topology_solver&) = delete;
-      gpu_topology_solver* operator = (const gpu_topology_solver&) = delete;
+      gpu_topology_solver& operator = (const gpu_topology_solver&) = delete;
 
       //  Run the full static max-flow (Algorithm 1) on GPU
-      int solve(int kernel_cycles = 0) {
+      cap_t solve(int kernel_cycles = 0) {
         int V = net.num_nodes;
         int E = net.num_edges;
         if (kernel_cycles <= 0) {
@@ -167,8 +167,8 @@ namespace maxflow {
         }
 
         //  Read back max-flow = excess[sink]
-        int flow;
-        MAXFLOW_CUDA_CHECK(cudaMemcpy(&flow, d_excess + net.sink, sizeof(int), cudaMemcpyDeviceToHost));
+        cap_t flow;
+        MAXFLOW_CUDA_CHECK(cudaMemcpy(&flow, d_excess + net.sink, sizeof(cap_t), cudaMemcpyDeviceToHost));
 
         //  Read back heights for min-cut
         h_height.resize(V);
@@ -183,15 +183,15 @@ namespace maxflow {
       }
     
     private:
-      flow_network<int>& net;
+      flow_network<cap_t>& net;
 
       // Device pointers
       int* d_offset = nullptr;
       int* d_edge_dst = nullptr;
-      int* d_capacity = nullptr;
-      int* d_residual_capacity = nullptr;
+      cap_t* d_capacity = nullptr;
+      cap_t* d_residual_capacity = nullptr;
       int* d_reverse_index = nullptr;
-      int* d_excess = nullptr;
+      cap_t* d_excess = nullptr;
       int* d_height = nullptr;
       int* d_flag = nullptr;
 
