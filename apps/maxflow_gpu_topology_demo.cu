@@ -20,7 +20,7 @@ int main(int argc, char const *argv[]) {
   std::cout << "GPU: " << prop.name << "\n";
 
   //  Read graph on host
-  maxflow::flow_network<int> net = maxflow::read_dimacs_maxflow<int>(argv[1]);
+  maxflow::flow_network<maxflow::cap_t> net = maxflow::read_dimacs_maxflow<maxflow::cap_t>(argv[1]);
   std::cout << "graph: " << net.num_nodes << " nodes, "
             << net.num_edges << " half-edges, source=" << net.source
             << ", sink=" << net.sink << "\n";
@@ -33,7 +33,7 @@ int main(int argc, char const *argv[]) {
   cudaEventCreate(&t_stop);
 
   cudaEventRecord(t_start);
-  int flow = solver.solve();
+  maxflow::cap_t flow = solver.solve();
   cudaEventRecord(t_stop);
   cudaEventSynchronize(t_stop);
 
