@@ -26,13 +26,13 @@ namespace maxflow {
 
   //  Build initial worklist: scan all vertices, colelct active ones
   //  Active = not s/t, excess > 0, height < |V|
-  __global__ void worklist_build_kernel(int num_nodes, int source, int sink, const int* excess, const int* height, int* worklist, int* wl_count) {
+  __global__ void worklist_build_kernel(int num_nodes, int source, int sink, const cap_t* excess, const int* height, int* worklist, int* wl_count) {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     if (u >= num_nodes || u == source || u == sink) {
       return;
     }
 
-    if (excess[u] > 0 && height[u] < num_nodes) {
+    if (excess[u] > cap_t(0) && height[u] < num_nodes) {
       int pos = atomicAdd(wl_count, 1);
       worklist[pos] = u;
     }
@@ -44,7 +44,7 @@ namespace maxflow {
   //  vertex is appended to worklist_out and host can schedule more round without full global relabel
   __global__ void worklist_push_relabel_kernel(
     int wl_size, int num_nodes, int source, int sink, int kernel_cycles, const int* worklist_in, const int* offset, const int* edge_dst, 
-    int* residual_capacity, const int* reverse_index, int* excess, int* height, int* worklist_out, int* wl_out_count, int* in_worklist) {
+    cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int* worklist_out, int* wl_out_count, int* in_worklist) {
       
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= wl_size) {
@@ -53,7 +53,7 @@ namespace maxflow {
     int u = worklist_in[idx];
 
     for (int cnt = 0; cnt < kernel_cycles; cnt++) {
-      if (!(height[u] < num_nodes && excess[u] > 0)) {
+      if (!(height[u] < num_nodes && excess[u] > cap_t(0))) {
         break;
       }
 
@@ -63,7 +63,7 @@ namespace maxflow {
       int e_hat = -1;
 
       for (int e = offset[u]; e < offset[u + 1]; e++) {
-        if (residual_capacity[e] > 0 && height[edge_dst[e]] < lowest_h) {
+        if (residual_capacity[e] > cap_t(0) && height[edge_dst[e]] < lowest_h) {
           lowest_h = height[edge_dst[e]];
           v_hat = edge_dst[e];
           e_hat = e;
@@ -76,9 +76,9 @@ namespace maxflow {
 
       if (height[u] > lowest_h) {
         //  Push
-        int a = excess[u];
-        int b = residual_capacity[e_hat];
-        int d = (a < b) ? a : b;
+        cap_t a = excess[u];
+        cap_t b = residual_capacity[e_hat];
+        cap_t d = (a < b) ? a : b;
         atomicAdd(&residual_capacity[e_hat], -d);
         atomicAdd(&residual_capacity[reverse_index[e_hat]], d);
         atomicAdd(&excess[u], -d);
@@ -98,7 +98,7 @@ namespace maxflow {
     }
 
     //  If u still active after kernel_cycles then add it back to output worklist
-    if (excess[u] > 0 && height[u] < num_nodes) {
+    if (excess[u] > cap_t(0) && height[u] < num_nodes) {
       if (atomicCAS(&in_worklist[u], 0, 1) == 0) {
         int pos = atomicAdd(wl_out_count, 1);
         worklist_out[pos] = u;
@@ -113,17 +113,17 @@ namespace maxflow {
 
   class gpu_worklist_solver {
     public:
-      explicit gpu_worklist_solver(flow_network<int>& net) : net(net) {
+      explicit gpu_worklist_solver(flow_network<cap_t>& net) : net(net) {
         int V = net.num_nodes;
         int E = net.num_edges;
 
         //  Graph arrays
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_offset,            (V + 1) * sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_edge_dst,          E       * sizeof(int)));
-        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_capacity,          E       * sizeof(int)));
-        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_residual_capacity, E       * sizeof(int)));
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_capacity,          E       * sizeof(cap_t)));
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_residual_capacity, E       * sizeof(cap_t)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_reverse_index,     E       * sizeof(int)));
-        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_excess,            V       * sizeof(int)));
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_excess,            V       * sizeof(cap_t)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_height,            V       * sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_flag,              1       * sizeof(int)));
 
@@ -140,7 +140,7 @@ namespace maxflow {
         //  Copy graph structure to device
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_offset, net.offset.data(), (V + 1) * sizeof(int), cudaMemcpyHostToDevice));
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_edge_dst, net.edge_dst.data(), E * sizeof(int), cudaMemcpyHostToDevice));
-        MAXFLOW_CUDA_CHECK(cudaMemcpy(d_capacity, net.capacity.data(), E * sizeof(int), cudaMemcpyHostToDevice));
+        MAXFLOW_CUDA_CHECK(cudaMemcpy(d_capacity, net.capacity.data(), E * sizeof(cap_t), cudaMemcpyHostToDevice));
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_reverse_index, net.reverse_index.data(), E * sizeof(int), cudaMemcpyHostToDevice));
       }
 
@@ -163,7 +163,7 @@ namespace maxflow {
       gpu_worklist_solver(const gpu_worklist_solver&) = delete;
       gpu_worklist_solver& operator=(const gpu_worklist_solver&) = delete;
 
-      int solve(int kernel_cycles = 0) {
+      cap_t solve(int kernel_cycles = 0) {
         int V = net.num_nodes;
         int E = net.num_edges;
         if (kernel_cycles <= 0) {
@@ -176,7 +176,7 @@ namespace maxflow {
         int h_val;
 
         //  Algorithm 1 : initialize
-        gpu_initialize_kernel<<<blocks_v, threads>>>(V, E, net.source, d_capacity, d_residual_capacity, d_excess, d_height);
+        gpu_initialize_kernel<<<blocks_max, threads>>>(V, E, net.source, d_capacity, d_residual_capacity, d_excess, d_height);
         MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 
         //  Algorithm 1 : saturate source
@@ -257,8 +257,8 @@ namespace maxflow {
         }
 
         //  Read back results
-        int flow;
-        MAXFLOW_CUDA_CHECK(cudaMemcpy(&flow, d_excess + net.sink, sizeof(int), cudaMemcpyDeviceToHost));
+        cap_t flow;
+        MAXFLOW_CUDA_CHECK(cudaMemcpy(&flow, d_excess + net.sink, sizeof(cap_t), cudaMemcpyDeviceToHost));
 
         h_height.resize(V);
         MAXFLOW_CUDA_CHECK(cudaMemcpy(h_height.data(), d_height, V * sizeof(int), cudaMemcpyDeviceToHost));
@@ -271,15 +271,15 @@ namespace maxflow {
       }
 
     private:
-      flow_network<int>& net;
+      flow_network<cap_t>& net;
 
       // Device graph arrays
       int* d_offset = nullptr;
       int* d_edge_dst = nullptr;
-      int* d_capacity = nullptr;
-      int* d_residual_capacity = nullptr;
+      cap_t* d_capacity = nullptr;
+      cap_t* d_residual_capacity = nullptr;
       int* d_reverse_index = nullptr;
-      int* d_excess = nullptr;
+      cap_t* d_excess = nullptr;
       int* d_height = nullptr;
       int* d_flag = nullptr;
 
