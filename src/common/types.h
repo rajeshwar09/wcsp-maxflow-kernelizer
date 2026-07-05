@@ -16,6 +16,11 @@ namespace maxflow {
   // half-edge is just an index into the edge arrays
   using edge_id_t = int;
 
+  // Convergence threshold for floating-point capacities
+  // Filters out residual micro-excess from double rounding
+  // When cap_t = int, this evaluates to int(1e-8) = 0 (no effect)
+  #define MAXFLOW_EPSILON cap_t(1e-8)
+
 } // namespace maxflow
 
 #endif // MAXFLOW_TYPES_H
