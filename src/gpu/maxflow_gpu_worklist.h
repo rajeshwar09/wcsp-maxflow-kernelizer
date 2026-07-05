@@ -32,7 +32,7 @@ namespace maxflow {
       return;
     }
 
-    if (excess[u] > cap_t(0) && height[u] < num_nodes) {
+    if (excess[u] > MAXFLOW_EPSILON && height[u] < num_nodes) {
       int pos = atomicAdd(wl_count, 1);
       worklist[pos] = u;
     }
@@ -53,7 +53,7 @@ namespace maxflow {
     int u = worklist_in[idx];
 
     for (int cnt = 0; cnt < kernel_cycles; cnt++) {
-      if (!(height[u] < num_nodes && excess[u] > cap_t(0))) {
+      if (!(height[u] < num_nodes && excess[u] > MAXFLOW_EPSILON)) {
         break;
       }
 
@@ -63,7 +63,7 @@ namespace maxflow {
       int e_hat = -1;
 
       for (int e = offset[u]; e < offset[u + 1]; e++) {
-        if (residual_capacity[e] > cap_t(0) && height[edge_dst[e]] < lowest_h) {
+        if (residual_capacity[e] > MAXFLOW_EPSILON && height[edge_dst[e]] < lowest_h) {
           lowest_h = height[edge_dst[e]];
           v_hat = edge_dst[e];
           e_hat = e;
@@ -98,7 +98,7 @@ namespace maxflow {
     }
 
     //  If u still active after kernel_cycles then add it back to output worklist
-    if (excess[u] > cap_t(0) && height[u] < num_nodes) {
+    if (excess[u] > MAXFLOW_EPSILON && height[u] < num_nodes) {
       if (atomicCAS(&in_worklist[u], 0, 1) == 0) {
         int pos = atomicAdd(wl_out_count, 1);
         worklist_out[pos] = u;

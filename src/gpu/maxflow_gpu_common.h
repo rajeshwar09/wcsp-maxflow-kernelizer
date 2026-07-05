@@ -54,7 +54,7 @@ namespace maxflow {
     }
 
     cap_t cap = capacity[e];
-    if (cap > cap_t(0)) {
+    if (cap > MAXFLOW_EPSILON) {
       residual_capacity[e] = cap_t(0);                      // cf(s,v) = 0
       atomicAdd(&residual_capacity[reverse_index[e]], cap); // cf(v,s) += c(s,v)
       atomicAdd(&excess[edge_dst[e]], cap);                 // e(v) += c(s,v)
@@ -89,7 +89,7 @@ namespace maxflow {
     for (int e = offset[u]; e < offset[u + 1]; e++) {
       int v = edge_dst[e];
       //  v can step to u iff v->u has residual
-      if (residual_capacity[reverse_index[e]] > cap_t(0) && height[v] == num_nodes) {
+      if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
         height[v] = level + 1;
         *flag = 1;  // => host must launch another layer
       }
@@ -109,7 +109,7 @@ namespace maxflow {
     for (int e = offset[u]; e < offset[u + 1]; e++) {
       int v = edge_dst[e];
       cap_t rc = residual_capacity[e];
-      if (rc > cap_t(0) && height[u] > height[v] + 1) {
+      if (rc > MAXFLOW_EPSILON && height[u] > height[v] + 1) {
         residual_capacity[e] = cap_t(0);
         atomicAdd(&residual_capacity[reverse_index[e]], rc);
         atomicAdd(&excess[u], -rc);
@@ -124,7 +124,7 @@ namespace maxflow {
     if (u >= num_nodes || u == source || u == sink) {
       return;
     }
-    if (excess[u] > cap_t(0) && height[u] < num_nodes) {
+    if (excess[u] > MAXFLOW_EPSILON && height[u] < num_nodes) {
       *flag = 1;
     }
   }

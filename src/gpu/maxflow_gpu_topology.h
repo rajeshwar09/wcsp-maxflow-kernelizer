@@ -23,7 +23,7 @@ namespace maxflow {
     }
 
     for (int cnt = 0; cnt < kernel_cycles; cnt++) {
-      if (!(height[u] < num_nodes && excess[u] > cap_t(0))) {
+      if (!(height[u] < num_nodes && excess[u] > MAXFLOW_EPSILON)) {
         break;  // u not active
       }
       
@@ -33,7 +33,7 @@ namespace maxflow {
       int e_hat = -1;
 
       for (int e = offset[u]; e < offset[u + 1]; e++) {
-        if (residual_capacity[e] > cap_t(0) && height[edge_dst[e]] < lowest_h) {
+        if (residual_capacity[e] > MAXFLOW_EPSILON && height[edge_dst[e]] < lowest_h) {
           lowest_h = height[edge_dst[e]];
           v_hat = edge_dst[e];
           e_hat = e;
