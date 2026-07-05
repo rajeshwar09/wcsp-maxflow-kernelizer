@@ -71,7 +71,7 @@ namespace maxflow {
         vertex_id_t s = net.source;
         for (edge_id_t e = net.offset[s]; e < net.offset[s + 1]; e++) {
           cap_t d = net.capacity[e];
-          if (d > cap_t(0)) {
+          if (d > MAXFLOW_EPSILON) {
             net.residual_capacity[e] = cap_t(0);
             net.residual_capacity[net.reverse_index[e]] += d;
             excess[net.edge_dst[e]] += d;
@@ -106,7 +106,7 @@ namespace maxflow {
           // For each u->v : vertex v can step to u iff v->u still has residual capacity
           for (edge_id_t e = net.offset[u]; e < net.offset[u + 1]; e++) {
             vertex_id_t v = net.edge_dst[e];
-            if (net.residual_capacity[net.reverse_index[e]] > cap_t(0) && height[v] == net.num_nodes) {
+            if (net.residual_capacity[net.reverse_index[e]] > MAXFLOW_EPSILON && height[v] == net.num_nodes) {
               height[v] = height[u] + 1;
               q.push(v);
             }
@@ -122,7 +122,7 @@ namespace maxflow {
           }
 
           for (int cnt = 0; cnt < kernel_cycles; cnt++) {
-            if (!(height[u] < net.num_nodes && excess[u] > cap_t(0))) {
+            if (!(height[u] < net.num_nodes && excess[u] > MAXFLOW_EPSILON)) {
               break;
             }
 
@@ -131,7 +131,7 @@ namespace maxflow {
             vertex_id_t v_hat = -1;
             edge_id_t e_hat = -1;
             for (edge_id_t e = net.offset[u]; e < net.offset[u + 1]; e++) {
-              if (net.residual_capacity[e] > cap_t(0) && height[net.edge_dst[e]] < lowest_h) {
+              if (net.residual_capacity[e] > MAXFLOW_EPSILON && height[net.edge_dst[e]] < lowest_h) {
                 lowest_h = height[net.edge_dst[e]];
                 v_hat = net.edge_dst[e];
                 e_hat = e;
@@ -168,7 +168,7 @@ namespace maxflow {
 
           for (edge_id_t e = net.offset[u]; e < net.offset[u + 1]; e++) {
             vertex_id_t v = net.edge_dst[e];
-            if (net.residual_capacity[e] > cap_t(0) && height[u] > height[v] + 1) {
+            if (net.residual_capacity[e] > MAXFLOW_EPSILON && height[u] > height[v] + 1) {
               cap_t d = net.residual_capacity[e];
               excess[u] -= d;
               excess[v] += d;
