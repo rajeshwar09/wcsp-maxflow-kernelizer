@@ -1,8 +1,25 @@
+# Build directories
 build/
-*.o
-*.out
-.DS_Store
 third_party/**/build/
 third_party/cuda
+
+# Compiled objects and binaries
+*.o
+*.out
+*.exe
+
+# Executables with no file extension, in root and any subfolder
+/e2e_pipeline_test
+/e2e_pipeline_nokernelize
+/benchmark_mac
+/maxflow_cpu_demo
+/maxflow_gpu_topology_demo
+/maxflow_gpu_worklist_demo
+/kernelizer_maxflow_test
+
+# Editor/OS files
+.DS_Store
 .vscode
-benchmark_macbenchmark_mac
+
+# Large generated benchmark data
+data/wcsp/*.wcsp
