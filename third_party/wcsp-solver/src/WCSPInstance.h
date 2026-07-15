@@ -39,7 +39,7 @@
 #include <boost/dynamic_bitset.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
-// #include <cblas.h>
+#include <cblas.h>
 
 #include "global.h"
 #include "RunningTime.h"
@@ -264,7 +264,7 @@ public:
         for (size_t i = 0; i < max_int; ++ i)
             x[i] = getWeight(value_t(s, i));
 
-        // cblas_dtrsv(CblasColMajor, CblasLower, CblasNoTrans, CblasUnit, max_int, a, max_int, x, 1);
+        cblas_dtrsv(CblasColMajor, CblasLower, CblasNoTrans, CblasUnit, max_int, a, max_int, x, 1);
         delete[] a;
 
         // Insert all the coefficients into the polynomial.
