@@ -1,7 +1,6 @@
 #!/usr/bin/python3
 # Low-arity variant of gen_wcsp.py: forces arity=2 for every constraint (pairwise only),
-# which minimizes the polynomial-expansion blow-up in the CCG (each 2-variable
-# constraint only ever adds ONE multi-variable polynomial term).
+# which minimizes the polynomial-expansion blow-up in the CCG (each 2-variable constraint only ever adds ONE multi-variable polynomial term)
 import random
 import itertools
 import sys

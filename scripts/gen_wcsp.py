@@ -1,8 +1,7 @@
 #!/usr/bin/python3
 # Adapted from wcsp-solver/scripts/gen-random-wcsp.py
-# Adds CLI args for variable/constraint count and a fixed seed for reproducibility.
-# Constraint arity is randomly 2-4 (like the original script) -- expect noticeable
-# CCG blow-up vs. the WCSP variable count (auxiliary vertices per polynomial term).
+# Adds CLI args for variable/constraint count and a fixed seed for reproducibility
+# Constraint arity is randomly 2-4 (like the original script) -- expect CCG blow-up vs WCSP variable count (auxiliary vertices per polynomial term)
 import random
 import itertools
 import sys
