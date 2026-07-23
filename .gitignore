@@ -23,3 +23,9 @@ third_party/cuda
 
 # Large generated benchmark data
 data/wcsp/*.wcsp
+# Benchmark outputs (regenerable)
+*.xlsx
+*.raw.json
+*.raw.csv
+*.avg.json
+results.csv
