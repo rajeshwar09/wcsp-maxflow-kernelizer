@@ -293,32 +293,75 @@ def generate_observations(data, avg_cache, kernelizer_label, repeats):
 											f"confirming kernelization is the dominant cost at scale.")
 				break
 
-	# Scaling trend of kernelize
-	kpts = [(e["wcsp_vars"], avg_cache[e["file"]][1].get("kernelize"))
-					for e in data if e["wcsp_vars"] and avg_cache[e["file"]][1].get("kernelize")]
-	kpts = [(v, k) for v, k in kpts if k is not None]
-	if len(kpts) >= 2:
-		(v0, k0), (v1, k1) = kpts[0], kpts[-1]
+	# Scaling trend of kernelize, reported separately for each constraint type.
+	# Mixed-arity and pairwise instances produce very different graph sizes, so
+	# comparing one against the other would be misleading.
+	lines.append("3. How kernelize time grows with problem size:")
+	groups = {"mixed arity (2-4)": [], "pairwise only (arity 2)": []}
+	for e in data:
+		k = avg_cache[e["file"]][1].get("kernelize")
+		if not e["wcsp_vars"] or k is None:
+			continue
+		key = "pairwise only (arity 2)" if "pairwise" in e["file"].lower() else "mixed arity (2-4)"
+		groups[key].append((e["wcsp_vars"], k, e["file"]))
+	for gname, pts in groups.items():
+		pts.sort()
+		if len(pts) < 2:
+			continue
+		(v0, k0, f0), (v1, k1, f1) = pts[0], pts[-1]
 		if v0 > 0 and k0 > 0:
-			size_ratio = v1 / v0
-			time_ratio = k1 / k0
-			lines.append(f"3. Kernelize time scaling: as the problem grew {size_ratio:.0f}x "
-										f"(from {v0:,} to {v1:,} vars), kernelize time grew {time_ratio:.0f}x "
-										f"(from {k0:.4f} s to {k1:.4f} s).")
+			lines.append(f"   - {gname}: from {f0} ({v0:,} vars, {k0:.4f} s) to "
+										f"{f1} ({v1:,} vars, {k1:.2f} s) — problem grew {v1/v0:.0f}x, "
+										f"kernelize time grew {k1/k0:.0f}x.")
+
+	# Measurement stability: how much did kernelize vary between repeats?
+	lines.append("")
+	lines.append("4. Measurement stability (kernelize stage, spread across the repeats):")
+	unstable = []
+	for entry in data:
+		ks = [r["kernelize"] for r in entry["runs"] if "kernelize" in r]
+		if len(ks) < 2:
+			continue
+		lo, hi = min(ks), max(ks)
+		med = statistics.median(ks)
+		ratio = hi / lo if lo > 0 else float("inf")
+		# Below ~10 ms the timer resolution itself dominates, so a large ratio there
+		# is measurement noise rather than real instability. Report it, don't flag it.
+		too_fast = hi < 0.01
+		if too_fast:
+			verdict = "too fast to time reliably"
+		elif ratio < 1.25:
+			verdict = "stable"
+		else:
+			verdict = "check this one"
+		lines.append(f"   - {entry['file']}: min {lo:.4f} s, median {med:.4f} s, max {hi:.4f} s, "
+									f"spread {ratio:.2f}x ({verdict}).")
+		if ratio >= 1.25 and not too_fast:
+			unstable.append((entry["file"], ratio, med, statistics.mean(ks)))
+	if unstable:
+		lines.append("")
+		lines.append("   Where the spread is above 1.25x, one repeat was much slower than the rest. "
+									"For those files the median is a better number to quote than the mean, because a "
+									"single slow repeat pulls the mean up:")
+		for name, ratio, med, mean in unstable:
+			lines.append(f"   - {name}: median {med:.2f} s vs mean {mean:.2f} s.")
+	else:
+		lines.append("   All files stayed within 1.25x across repeats, so the means are reliable.")
 
 	# Resolved-variables observation
+	lines.append("")
+	lines.append("5. How much each instance was reduced by the kernelizer:")
 	for entry in data:
 		resv = entry["outcome"].get("resolved")
 		if resv and entry["wcsp_vars"]:
 			pct = int(resv) / entry["wcsp_vars"] * 100
-			lines.append(f"   - {entry['file']}: kernelizer resolved {int(resv):,} variables {pct:.1f}% of {entry['wcsp_vars']:,}).")
+			lines.append(f"   - {entry['file']}: kernelizer resolved {int(resv):,} variables ({pct:.1f}% of {entry['wcsp_vars']:,}).")
 
 	lines.append("")
 	lines.append("Note: 'Remnant s' is just an internal bookkeeping constant, not the final objective. "
-								"Timings vary slightly run-to-run due to OS scheduling, etc")
+								"Each file was benchmarked on its own, not back-to-back, so that memory pressure from a "
+								"previous large run does not distort the next one.")
 	return lines
-
-
 # Sidecar (lets --merge reload averaged data without re-running the harness)
 def _sidecar_path(xlsx_path):
 	return xlsx_path + ".avg.json"
@@ -470,9 +513,30 @@ def main():
 	ap.add_argument("--out", required=True, help="output .xlsx path")
 	ap.add_argument("--merge", nargs=2, metavar=("A.xlsx", "B.xlsx"), help="merge two previously-produced workbooks into a comparison")
 	ap.add_argument("--from-json", help="rebuild the .xlsx from a previously saved .raw.json (skips benchmarking)")
+	ap.add_argument("--merge-raw", nargs="+", metavar="RAW.JSON", help="combine several .raw.json files into one workbook + one combined .raw.json")
 	args = ap.parse_args()
 
-	# Rebuild the workbook from saved raw results, without re-running anything.
+	# Combine several per-file .raw.json runs into a single workbook
+	if args.merge_raw:
+		import json
+		combined = []
+		label = None
+		reps = None
+		for p in args.merge_raw:
+			with open(p) as f:
+				payload = json.load(f)
+			label = label or payload.get("kernelizer")
+			reps = reps or payload.get("repeats")
+			combined.extend(payload["data"])
+		combined.sort(key=lambda e: (e["wcsp_vars"] or 0, e["file"]))
+		out_raw = args.out + ".raw.json"
+		with open(out_raw, "w") as f:
+			json.dump({"kernelizer": label, "repeats": reps, "data": combined}, f, indent=2)
+		print(f"[wrote combined raw results to {out_raw}]", file=sys.stderr)
+		write_workbook(combined, label, args.out, reps)
+		return
+
+	# Rebuild the workbook from saved raw results, without re-running anything
 	if args.from_json:
 		import json
 		with open(args.from_json) as f:
