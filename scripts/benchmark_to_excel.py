@@ -37,6 +37,11 @@ python3 scripts/benchmark_to_excel.py \
 	--merge maxflow_results.xlsx gurobi_results.xlsx \
 	--out comparison.xlsx
 
+# 4) Rebuild the .xlsx from a saved .raw.json without re-running the benchmark
+python3 scripts/benchmark_to_excel.py \
+	--from-json maxflow_results.xlsx.raw.json \
+	--out maxflow_results.xlsx
+
 Expected harness stdout (both maxflow and gurobi harnesses must print these lines):
 [parse DIMACS]        <sec> s
 [toPolynomial all]    <sec> s
@@ -53,7 +58,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 import statistics
 
 # Stage keys in canonical order. The "kernelize" stage label varies by kernelizer, so I match it with a regex rather than a fixed string
@@ -209,7 +213,7 @@ def write_workbook(data, kernelizer_label, out_path, repeats):
 	ws2["A3"].font = Font(name="Arial", bold=True, size=11)
 	thdr = ["file", "WCSP vars"] + STAGES
 	for j, h in enumerate(thdr, start=1):
-			ws2.cell(row=4, column=j, value=h)
+		ws2.cell(row=4, column=j, value=h)
 	style_header(ws2, 4, len(thdr))
 	rr = 5
 	avg_cache = {}
@@ -235,7 +239,6 @@ def write_workbook(data, kernelizer_label, out_path, repeats):
 	for j, h in enumerate(vhdr, start=1):
 		ws2.cell(row=rr, column=j, value=h)
 	style_header(ws2, rr, len(vhdr))
-	hdr_row = rr
 	rr += 1
 	for entry in data:
 		ws2.cell(row=rr, column=1, value=entry["file"]).font = normal
@@ -305,10 +308,10 @@ def generate_observations(data, avg_cache, kernelizer_label, repeats):
 
 	# Resolved-variables observation
 	for entry in data:
-			resv = entry["outcome"].get("resolved")
-			if resv and entry["wcsp_vars"]:
-					pct = int(resv) / entry["wcsp_vars"] * 100
-					lines.append(f"   - {entry['file']}: kernelizer resolved {int(resv):,} variables {pct:.1f}% of {entry['wcsp_vars']:,}).")
+		resv = entry["outcome"].get("resolved")
+		if resv and entry["wcsp_vars"]:
+			pct = int(resv) / entry["wcsp_vars"] * 100
+			lines.append(f"   - {entry['file']}: kernelizer resolved {int(resv):,} variables {pct:.1f}% of {entry['wcsp_vars']:,}).")
 
 	lines.append("")
 	lines.append("Note: 'Remnant s' is just an internal bookkeeping constant, not the final objective. "
@@ -466,14 +469,23 @@ def main():
 	ap.add_argument("--timeout", type=float, default=None, help="per-run timeout (seconds)")
 	ap.add_argument("--out", required=True, help="output .xlsx path")
 	ap.add_argument("--merge", nargs=2, metavar=("A.xlsx", "B.xlsx"), help="merge two previously-produced workbooks into a comparison")
+	ap.add_argument("--from-json", help="rebuild the .xlsx from a previously saved .raw.json (skips benchmarking)")
 	args = ap.parse_args()
+
+	# Rebuild the workbook from saved raw results, without re-running anything.
+	if args.from_json:
+		import json
+		with open(args.from_json) as f:
+			payload = json.load(f)
+		write_workbook(payload["data"], payload["kernelizer"], args.out, payload["repeats"])
+		return
 
 	if args.merge:
 		write_comparison(args.merge[0], args.merge[1], args.out)
 		return
 
 	if not args.harness:
-		ap.error("--harness is required unless --merge is used")
+		ap.error("--harness is required unless --merge or --from-json is used")
 	files = list(args.files)
 	if args.dir:
 		files += sorted(glob.glob(os.path.join(args.dir, "*.wcsp")))
@@ -512,7 +524,7 @@ def main():
 		write_workbook(data, args.kernelizer, args.out, args.repeats)
 	except ImportError:
 		print("\nopenpyxl is not installed, so the .xlsx was not written.", file=sys.stderr)
-		print(f"  python3 scripts/json_to_excel.py {raw_path} --out {args.out}", file=sys.stderr)
+		print(f"  python3 scripts/benchmark_to_excel.py --from-json {raw_path} --out {args.out}", file=sys.stderr)
 
 
 if __name__ == "__main__":
