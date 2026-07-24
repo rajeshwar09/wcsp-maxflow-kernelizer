@@ -16,6 +16,8 @@ third_party/cuda
 /maxflow_gpu_topology_demo
 /maxflow_gpu_worklist_demo
 /kernelizer_maxflow_test
+/compare_kernels
+/e2e_pipeline_test_gurobi
 
 # Editor/OS files
 .DS_Store
@@ -23,7 +25,8 @@ third_party/cuda
 
 # Large generated benchmark data
 data/wcsp/*.wcsp
-# Benchmark outputs (regenerable)
+
+# Benchmark outputs
 *.xlsx
 *.raw.json
 *.raw.csv
