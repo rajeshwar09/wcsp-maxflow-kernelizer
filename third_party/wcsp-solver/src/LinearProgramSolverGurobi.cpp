@@ -22,12 +22,39 @@
 #include "LinearProgramSolverGurobi.h"
 #include <iostream>
 
+#include <cstdlib>
+
+// Gurobi thread count, read from the WCSP_GUROBI_THREADS environment variable. If not set then it is equals to 1
+static int wcspGurobiThreads()
+{
+    const char* s = std::getenv("WCSP_GUROBI_THREADS");
+    if (!s) return 1;
+    int n = std::atoi(s);
+    return (n > 0) ? n : 1;
+}
+
+// Gurobi's LP algorithm, read from WCSP_GUROBI_METHOD
+//   -1 = automatic (Gurobi chooses default)
+//    0 = primal simplex
+//    1 = dual simplex
+//    2 = barrier / interior point
+//    3 = concurrent
+// Unset gives -1, which is a no-op relative to original behaviour
+static int wcspGurobiMethod()
+{
+    const char* s = std::getenv("WCSP_GUROBI_METHOD");
+    if (!s) return -1;
+    return std::atoi(s);
+}
+
 LinearProgramSolverGurobi::LinearProgramSolverGurobi()
 {
     try
     {
         gurobiEnv.reset(new GRBEnv());
-        gurobiEnv->set(GRB_IntParam_Threads, 1);  // single thread
+        // gurobiEnv->set(GRB_IntParam_Threads, 1);  // single thread
+        gurobiEnv->set(GRB_IntParam_Threads, wcspGurobiThreads());  // see WCSP_GUROBI_THREADS
+        gurobiEnv->set(GRB_IntParam_Method, wcspGurobiMethod());    // see WCSP_GUROBI_METHOD
         gurobiModel.reset(new GRBModel(*gurobiEnv));
     } catch (GRBException e)
     {
@@ -151,7 +178,9 @@ void LinearProgramSolverGurobi::reset()
     gurobiConstraints.clear();
     std::unique_ptr<GRBEnv> env = std::move(gurobiEnv);
     gurobiEnv.reset(new GRBEnv());
-    gurobiEnv->set(GRB_IntParam_Threads, 1);  // single thread
+    // gurobiEnv->set(GRB_IntParam_Threads, 1);  // single thread
+    gurobiEnv->set(GRB_IntParam_Threads, wcspGurobiThreads());  // see WCSP_GUROBI_THREADS
+    gurobiEnv->set(GRB_IntParam_Method, wcspGurobiMethod());    // see WCSP_GUROBI_METHOD
     gurobiModel.reset(new GRBModel(*gurobiEnv));
 }
 
