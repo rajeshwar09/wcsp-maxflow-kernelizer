@@ -4,14 +4,8 @@
 #include "src/gpu/maxflow_gpu_common.h"
 
 namespace maxflow {
-  
-  //  ------------------------------------------------------------------------------------
   //  Topology-driven Push-Relabel approach
-  //
-  //  File contains topology-specific kernel and solver
-  //  Shared kernels: (init, saturate, BFS, remove-invalid, check-active)
-  //  taken from "maxflow_gpu_common.h"
-  //  ------------------------------------------------------------------------------------
+  //  File contains topology-specific kernel and solver Shared kernels: (init, saturate, BFS, remove-invalid, check-active) taken from "maxflow_gpu_common.h"
 
   //  Algorithm 2: Push-relabel sweep
   //  Each thread does upto kernel_cycles times
@@ -26,7 +20,7 @@ namespace maxflow {
       if (!(height[u] < num_nodes && excess[u] > MAXFLOW_EPSILON)) {
         break;  // u not active
       }
-      
+
       //  Find lowest-height neighbour reachable via residual edge
       int lowest_h = num_nodes + 1;
       int v_hat = -1;
@@ -127,7 +121,7 @@ namespace maxflow {
           int blocks_s = (src_count + threads - 1) / threads;
           gpu_saturate_source_kernel<<<blocks_s, threads>>>(src_start, src_end, net.source, d_edge_dst, d_capacity, d_residual_capacity, d_reverse_index, d_excess);
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-        } 
+        }
 
         //  Algorithm 1: main loop
         int h_flag;
@@ -166,11 +160,28 @@ namespace maxflow {
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
         }
 
+        //  Final global relabel -> clean, deterministic min-cut
+        {
+          gpu_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
+          MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+
+          for (int level = 0; level < V; level++) {
+            h_flag = 0;
+            MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_flag, sizeof(int), cudaMemcpyHostToDevice));
+            gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
+            MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+            MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
+            if (!h_flag) {
+              break;  //  no new vertices reached => BFS complete
+            }
+          }
+        }
+
         //  Read back max-flow = excess[sink]
         cap_t flow;
         MAXFLOW_CUDA_CHECK(cudaMemcpy(&flow, d_excess + net.sink, sizeof(cap_t), cudaMemcpyDeviceToHost));
 
-        //  Read back heights for min-cut
+        //  Read back heights for min-cut (clean and deterministic)
         h_height.resize(V);
         MAXFLOW_CUDA_CHECK(cudaMemcpy(h_height.data(), d_height, V * sizeof(int), cudaMemcpyDeviceToHost));
 
@@ -181,7 +192,7 @@ namespace maxflow {
       bool is_on_source_side(vertex_id_t v) const {
         return h_height[v] >= net.num_nodes;
       }
-    
+
     private:
       flow_network<cap_t>& net;
 
