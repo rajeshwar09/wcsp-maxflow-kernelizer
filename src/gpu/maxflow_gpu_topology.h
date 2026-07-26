@@ -128,15 +128,6 @@ namespace maxflow {
         int loop_iters = 0;
         while (true) {
           loop_iters++;
-          //  Check for active vertices
-          h_flag = 0;
-          MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_flag, sizeof(int), cudaMemcpyHostToDevice));
-          gpu_check_active_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_excess, d_height, d_flag);
-          MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-          MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
-          if (!h_flag) {
-            break;  // no active vertex => done
-          }
 
           //  Algorithm 4: global relabel (backwards BFS)
           gpu_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
@@ -151,6 +142,17 @@ namespace maxflow {
             if (!h_flag) {
               break;  //  BFS finished => no more layers
             }
+          }
+
+          //  After a fresh relabel: check if any vertex still active
+          //  If not, height[] is now the clean distance-to-sink labeling and can stop -- this is the correct, drained, deterministic state
+          h_flag = 0;
+          MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_flag, sizeof(int), cudaMemcpyHostToDevice));
+          gpu_check_active_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_excess, d_height, d_flag);
+          MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+          MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
+          if (!h_flag) {
+            break;  //  no active vertex AFTER relabel => converged, heights clean
           }
 
           //  Algorithm 2: push-relabel sweep
