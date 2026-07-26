@@ -160,23 +160,6 @@ namespace maxflow {
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        //  Final global relabel -> clean, deterministic min-cut
-        {
-          gpu_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
-          MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-
-          for (int level = 0; level < V; level++) {
-            h_flag = 0;
-            MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_flag, sizeof(int), cudaMemcpyHostToDevice));
-            gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
-            MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-            MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
-            if (!h_flag) {
-              break;  //  no new vertices reached => BFS complete
-            }
-          }
-        }
-
         //  Read back max-flow = excess[sink]
         cap_t flow;
         MAXFLOW_CUDA_CHECK(cudaMemcpy(&flow, d_excess + net.sink, sizeof(cap_t), cudaMemcpyDeviceToHost));
