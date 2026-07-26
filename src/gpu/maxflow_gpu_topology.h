@@ -166,6 +166,23 @@ namespace maxflow {
 
         std::cerr << "[loop iters] " << loop_iters << "\n";
 
+        //  TEMP: count vertices (excluding source/sink) that still hold excess
+        {
+          std::vector<cap_t> h_excess(V);
+          MAXFLOW_CUDA_CHECK(cudaMemcpy(h_excess.data(), d_excess, V * sizeof(cap_t), cudaMemcpyDeviceToHost));
+          int stranded = 0;
+          double total_stranded = 0.0;
+          for (int v = 0; v < V; v++) {
+            if (v == net.source || v == net.sink) continue;
+            if (h_excess[v] > MAXFLOW_EPSILON) {
+              stranded++;
+              total_stranded += (double)h_excess[v];
+            }
+          }
+          std::cerr << "[stranded excess] " << stranded << " vertices, total = "
+                    << total_stranded << "\n";
+        }
+
         //  Read back max-flow = excess[sink]
         cap_t flow;
         MAXFLOW_CUDA_CHECK(cudaMemcpy(&flow, d_excess + net.sink, sizeof(cap_t), cudaMemcpyDeviceToHost));
