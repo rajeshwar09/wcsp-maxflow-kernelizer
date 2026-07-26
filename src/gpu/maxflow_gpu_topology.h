@@ -125,7 +125,9 @@ namespace maxflow {
 
         //  Algorithm 1: main loop
         int h_flag;
+        int loop_iters = 0;
         while (true) {
+          loop_iters++;
           //  Check for active vertices
           h_flag = 0;
           MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_flag, sizeof(int), cudaMemcpyHostToDevice));
@@ -159,6 +161,8 @@ namespace maxflow {
           gpu_remove_invalid_edges_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
         }
+
+        std::cerr << "[loop iters] " << loop_iters << "\n";
 
         //  Read back max-flow = excess[sink]
         cap_t flow;
