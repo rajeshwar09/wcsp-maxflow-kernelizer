@@ -134,14 +134,14 @@ namespace maxflow {
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 
           for (int level = 0; level < V; level++) {
-            h_flag = 0;
-            MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_flag, sizeof(int), cudaMemcpyHostToDevice));
+            // h_flag = 0;
+            // MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_flag, sizeof(int), cudaMemcpyHostToDevice));
             gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
             MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-            MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
-            if (!h_flag) {
-              break;  //  BFS finished => no more layers
-            }
+            // MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
+            // if (!h_flag) {
+            //   break;  //  BFS finished => no more layers
+            // }
           }
 
           //  After a fresh relabel: check if any vertex still active
