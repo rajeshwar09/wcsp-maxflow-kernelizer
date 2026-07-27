@@ -183,6 +183,23 @@ namespace maxflow {
                     << total_stranded << "\n";
         }
 
+        //  TEMP: histogram of final heights to compare CPU vs GPU relabel output
+        {
+          std::vector<int> hh(V);
+          MAXFLOW_CUDA_CHECK(cudaMemcpy(hh.data(), d_height, V * sizeof(int), cudaMemcpyDeviceToHost));
+          int at_numnodes = 0, zero = 0, between = 0, above = 0;
+          for (int v = 0; v < V; v++) {
+            if (hh[v] == 0) zero++;
+            else if (hh[v] == V) at_numnodes++;       // exactly num_nodes = unreached
+            else if (hh[v] < V) between++;            // reached, finite distance
+            else above++;                             // > num_nodes (shouldn't happen after clean relabel)
+          }
+          std::cerr << "[height histogram] zero=" << zero
+                    << " finite(<V)=" << between
+                    << " ==V(unreached)=" << at_numnodes
+                    << " >V=" << above << "\n";
+        }
+
         //  Read back max-flow = excess[sink]
         cap_t flow;
         MAXFLOW_CUDA_CHECK(cudaMemcpy(&flow, d_excess + net.sink, sizeof(cap_t), cudaMemcpyDeviceToHost));
