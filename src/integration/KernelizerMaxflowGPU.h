@@ -151,15 +151,6 @@ namespace maxflow {
         gpu_topology_solver solver(net);
         solver.solve();
 
-        // TEMP DIAGNOSTIC: how many flow-network nodes are source-side?
-        {
-          int src_side = 0;
-          for (int n_id = 0; n_id < flow_n; n_id++) {
-            if (solver.is_on_source_side(n_id)) src_side++;
-          }
-          std::cerr << "[source-side nodes] " << src_side << " of " << flow_n << "\n";
-        }
-
         //  4 : Extract NT classification from min-cut    
         //
         //  Classification:

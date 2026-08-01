@@ -4,8 +4,14 @@
 #include "src/gpu/maxflow_gpu_common.h"
 
 namespace maxflow {
+  
+  //  ------------------------------------------------------------------------------------
   //  Topology-driven Push-Relabel approach
-  //  File contains topology-specific kernel and solver Shared kernels: (init, saturate, BFS, remove-invalid, check-active) taken from "maxflow_gpu_common.h"
+  //
+  //  File contains topology-specific kernel and solver
+  //  Shared kernels: (init, saturate, BFS, remove-invalid, check-active)
+  //  taken from "maxflow_gpu_common.h"
+  //  ------------------------------------------------------------------------------------
 
   //  Algorithm 2: Push-relabel sweep
   //  Each thread does upto kernel_cycles times
@@ -20,7 +26,7 @@ namespace maxflow {
       if (!(height[u] < num_nodes && excess[u] > MAXFLOW_EPSILON)) {
         break;  // u not active
       }
-
+      
       //  Find lowest-height neighbour reachable via residual edge
       int lowest_h = num_nodes + 1;
       int v_hat = -1;
@@ -121,38 +127,34 @@ namespace maxflow {
           int blocks_s = (src_count + threads - 1) / threads;
           gpu_saturate_source_kernel<<<blocks_s, threads>>>(src_start, src_end, net.source, d_edge_dst, d_capacity, d_residual_capacity, d_reverse_index, d_excess);
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-        }
+        } 
 
         //  Algorithm 1: main loop
         int h_flag;
-        int loop_iters = 0;
         while (true) {
-          loop_iters++;
-
-          //  Algorithm 4: global relabel (backwards BFS)
-          gpu_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
-          MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-
-          for (int level = 0; level < V; level++) {
-            // h_flag = 0;
-            // MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_flag, sizeof(int), cudaMemcpyHostToDevice));
-            gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
-            MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-            // MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
-            // if (!h_flag) {
-            //   break;  //  BFS finished => no more layers
-            // }
-          }
-
-          //  After a fresh relabel: check if any vertex still active
-          //  If not, height[] is now the clean distance-to-sink labeling and can stop -- this is the correct, drained, deterministic state
+          //  Check for active vertices
           h_flag = 0;
           MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_flag, sizeof(int), cudaMemcpyHostToDevice));
           gpu_check_active_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_excess, d_height, d_flag);
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
           MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
           if (!h_flag) {
-            break;  //  no active vertex AFTER relabel => converged, heights clean
+            break;  // no active vertex => done
+          }
+
+          //  Algorithm 4: global relabel (backwards BFS)
+          gpu_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
+          MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+
+          for (int level = 0; level < V; level++) {
+            h_flag = 0;
+            MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &h_flag, sizeof(int), cudaMemcpyHostToDevice));
+            gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
+            MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+            MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
+            if (!h_flag) {
+              break;  //  BFS finished => no more layers
+            }
           }
 
           //  Algorithm 2: push-relabel sweep
@@ -164,47 +166,11 @@ namespace maxflow {
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        std::cerr << "[loop iters] " << loop_iters << "\n";
-
-        //  TEMP: count vertices (excluding source/sink) that still hold excess
-        {
-          std::vector<cap_t> h_excess(V);
-          MAXFLOW_CUDA_CHECK(cudaMemcpy(h_excess.data(), d_excess, V * sizeof(cap_t), cudaMemcpyDeviceToHost));
-          int stranded = 0;
-          double total_stranded = 0.0;
-          for (int v = 0; v < V; v++) {
-            if (v == net.source || v == net.sink) continue;
-            if (h_excess[v] > MAXFLOW_EPSILON) {
-              stranded++;
-              total_stranded += (double)h_excess[v];
-            }
-          }
-          std::cerr << "[stranded excess] " << stranded << " vertices, total = "
-                    << total_stranded << "\n";
-        }
-
-        //  TEMP: histogram of final heights to compare CPU vs GPU relabel output
-        {
-          std::vector<int> hh(V);
-          MAXFLOW_CUDA_CHECK(cudaMemcpy(hh.data(), d_height, V * sizeof(int), cudaMemcpyDeviceToHost));
-          int at_numnodes = 0, zero = 0, between = 0, above = 0;
-          for (int v = 0; v < V; v++) {
-            if (hh[v] == 0) zero++;
-            else if (hh[v] == V) at_numnodes++;       // exactly num_nodes = unreached
-            else if (hh[v] < V) between++;            // reached, finite distance
-            else above++;                             // > num_nodes (shouldn't happen after clean relabel)
-          }
-          std::cerr << "[height histogram] zero=" << zero
-                    << " finite(<V)=" << between
-                    << " ==V(unreached)=" << at_numnodes
-                    << " >V=" << above << "\n";
-        }
-
         //  Read back max-flow = excess[sink]
         cap_t flow;
         MAXFLOW_CUDA_CHECK(cudaMemcpy(&flow, d_excess + net.sink, sizeof(cap_t), cudaMemcpyDeviceToHost));
 
-        //  Read back heights for min-cut (clean and deterministic)
+        //  Read back heights for min-cut
         h_height.resize(V);
         MAXFLOW_CUDA_CHECK(cudaMemcpy(h_height.data(), d_height, V * sizeof(int), cudaMemcpyDeviceToHost));
 
@@ -215,7 +181,7 @@ namespace maxflow {
       bool is_on_source_side(vertex_id_t v) const {
         return h_height[v] >= net.num_nodes;
       }
-
+    
     private:
       flow_network<cap_t>& net;
 
