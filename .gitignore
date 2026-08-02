@@ -32,3 +32,11 @@ data/wcsp/*.wcsp
 *.raw.csv
 *.avg.json
 results.csv
+/cut_audit
+/compare_kernels_gpu
+/compare_gpu
+/cpu_demo
+/topo_demo
+/e2e_cpu
+/e2e_gpu
+/e2e_pipeline_test_gpu
