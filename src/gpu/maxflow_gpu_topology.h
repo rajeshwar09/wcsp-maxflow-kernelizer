@@ -4,14 +4,10 @@
 #include "src/gpu/maxflow_gpu_common.h"
 
 namespace maxflow {
-  
-  //  ------------------------------------------------------------------------------------
   //  Topology-driven Push-Relabel approach
   //
   //  File contains topology-specific kernel and solver
-  //  Shared kernels: (init, saturate, BFS, remove-invalid, check-active)
-  //  taken from "maxflow_gpu_common.h"
-  //  ------------------------------------------------------------------------------------
+  //  Shared kernels: (init, saturate, BFS, remove-invalid, check-active) taken from "maxflow_gpu_common.h"
 
   //  Algorithm 2: Push-relabel sweep
   //  Each thread does upto kernel_cycles times
@@ -26,7 +22,7 @@ namespace maxflow {
       if (!(height[u] < num_nodes && excess[u] > MAXFLOW_EPSILON)) {
         break;  // u not active
       }
-      
+
       //  Find lowest-height neighbour reachable via residual edge
       int lowest_h = num_nodes + 1;
       int v_hat = -1;
@@ -46,7 +42,6 @@ namespace maxflow {
 
       if (height[u] > lowest_h) {
         //  Push: send min(excess[u], residual[e_hat]) along e_hat
-        // int d = min(excess[u], residual_capacity[e_hat]);
         cap_t a = excess[u];
         cap_t b = residual_capacity[e_hat];
         cap_t d = (a < b) ? a : b;
@@ -63,7 +58,7 @@ namespace maxflow {
 
   //  Host Solver Class - Topology
   //
-  //  Takes a host-side flow_network<int>, copies it to GPU and run algorith 1
+  //  Takes a host-side flow_network<cap_t>, copies it to GPU and runs Algorithm 1
   //  Copies result back to host
   class gpu_topology_solver {
     public:
@@ -170,18 +165,22 @@ namespace maxflow {
         cap_t flow;
         MAXFLOW_CUDA_CHECK(cudaMemcpy(&flow, d_excess + net.sink, sizeof(cap_t), cudaMemcpyDeviceToHost));
 
-        //  Read back heights for min-cut
-        h_height.resize(V);
-        MAXFLOW_CUDA_CHECK(cudaMemcpy(h_height.data(), d_height, V * sizeof(int), cudaMemcpyDeviceToHost));
+        //  Read back final residuals and excess, then classify on the host
+        h_residual_capacity.resize(E);
+        h_excess.resize(V);
+        MAXFLOW_CUDA_CHECK(cudaMemcpy(h_residual_capacity.data(), d_residual_capacity, E * sizeof(cap_t), cudaMemcpyDeviceToHost));
+        MAXFLOW_CUDA_CHECK(cudaMemcpy(h_excess.data(), d_excess, V * sizeof(cap_t), cudaMemcpyDeviceToHost));
+
+        compute_source_side();
 
         return flow;
       }
 
-      //  After solve(): true if v is on the source side of min-cut
+      //  After solve(): true if v is on the source side of the min-cut
       bool is_on_source_side(vertex_id_t v) const {
-        return h_height[v] >= net.num_nodes;
+        return h_source_side[v] != 0;
       }
-    
+
     private:
       flow_network<cap_t>& net;
 
@@ -195,8 +194,48 @@ namespace maxflow {
       int* d_height = nullptr;
       int* d_flag = nullptr;
 
-      //  Host copy of heights
-      std::vector<int> h_height;
+      //  Host copies of the final state + the computed min-cut source side
+      std::vector<cap_t> h_residual_capacity;
+      std::vector<cap_t> h_excess;
+      std::vector<char> h_source_side;
+
+      //  Min-cut source side: residual-reachable from the source together with every vertex still holding excess
+      //
+      //  The algorithm terminates on a PREFLOW, not a flow: some units of flow never make it back to the source, so the source's own out-edges look
+      //  saturated and a plain forward BFS from the source alone would return just {source} 
+      //  Seeding the search with the stranded-excess vertices fixes exactly that
+      //  The resulting set is a reachability closure, so no residual edge leaves it, and it holds the source plus all excess --
+      //  its capacity equals the max-flow value
+      //  It depends only on the final residual graph, so it is deterministic of how the parallel push-relabel happened to schedule
+      void compute_source_side() {
+        int V = net.num_nodes;
+        h_source_side.assign(V, 0);
+
+        std::vector<vertex_id_t> stack;
+        stack.reserve(V);
+
+        h_source_side[net.source] = 1;
+        stack.push_back(net.source);
+        for (vertex_id_t v = 0; v < V; v++) {
+          if (v != net.source && v != net.sink
+              && h_excess[v] > MAXFLOW_EPSILON && !h_source_side[v]) {
+            h_source_side[v] = 1;
+            stack.push_back(v);
+          }
+        }
+
+        while (!stack.empty()) {
+          vertex_id_t u = stack.back();
+          stack.pop_back();
+          for (edge_id_t e = net.offset[u]; e < net.offset[u + 1]; e++) {
+            vertex_id_t v = net.edge_dst[e];
+            if (h_residual_capacity[e] > MAXFLOW_EPSILON && !h_source_side[v]) {
+              h_source_side[v] = 1;
+              stack.push_back(v);
+            }
+          }
+        }
+      }
   };
 
 } // namespace maxflow

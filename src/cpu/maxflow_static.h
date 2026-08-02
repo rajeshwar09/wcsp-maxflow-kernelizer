@@ -37,14 +37,21 @@ namespace maxflow {
           remove_invalid_edges(); // algorithm 3
         }
 
+        compute_source_side();
         return excess[net.sink];
       }
 
       // after solve(), a vertex is on the SOURCE side of min cut iff it cannot reach sink
       // This will be reused in kernelizer
+
+      //  Min-cut source side: residual-reachable from the source TOGETHER WITH every vertex still holding excess 
+      //  The algorithm terminates on a preflow, so the source's own edges look saturated even though the stranded units never returned -- 
+      //  seeding with the excess vertices is what makes this a genuine min-cut. No residual edge leaves the set, and it contains all excess, so its capacity equals the max-flow
       bool is_on_source_side(vertex_id_t v) const {
-        return height[v] >= net.num_nodes;
+        return source_side[v] != 0;
       }
+
+
       const std::vector<int>& heights() const {
         return height;
       }
@@ -53,6 +60,33 @@ namespace maxflow {
       flow_network<cap_t>& net;
       std::vector<cap_t> excess;  // excess[v] = e(v) : flow stuck at v
       std::vector<int> height;    // height[v] = h(v) : push-relabel height label
+
+      std::vector<char> source_side;   // min-cut source side, filled by compute_source_side()
+
+      void compute_source_side() {
+        source_side.assign(net.num_nodes, 0);
+        std::vector<vertex_id_t> stack;
+        source_side[net.source] = 1;
+        stack.push_back(net.source);
+        for (vertex_id_t v = 0; v < net.num_nodes; v++) {
+          if (v != net.source && v != net.sink
+              && excess[v] > MAXFLOW_EPSILON && !source_side[v]) {
+            source_side[v] = 1;
+            stack.push_back(v);
+          }
+        }
+        while (!stack.empty()) {
+          vertex_id_t u = stack.back();
+          stack.pop_back();
+          for (edge_id_t e = net.offset[u]; e < net.offset[u + 1]; e++) {
+            vertex_id_t v = net.edge_dst[e];
+            if (net.residual_capacity[e] > MAXFLOW_EPSILON && !source_side[v]) {
+              source_side[v] = 1;
+              stack.push_back(v);
+            }
+          }
+        }
+      }
 
       // Algorithm 1
       // residuals back to full capacity, excess/height to 0
