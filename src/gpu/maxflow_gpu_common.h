@@ -96,6 +96,37 @@ namespace maxflow {
     }
   }
 
+  //  Algorithm 4: One BFS layer (data-driven)
+  //  One thread per FRONTIER vertex instead of one thread per graph vertex
+  //
+  //  A whole BFS costs O(E) here instead of O(V x layers)
+  //
+  //  The plain read of height[v] before the atomicCAS matters: without it the
+  //  atomic fires on every residual edge examined (~E per BFS) rather than only
+  //  on genuine first discoveries (~V per BFS), which measured 14% SLOWER than
+  //  the topology-driven kernel it replaces. The read is racy by design -- the
+  //  atomicCAS still arbitrates, the read only filters out the common case where
+  //  v was claimed long ago
+  __global__ void gpu_bfs_frontier_step_kernel(int frontier_size, int num_nodes, int level, const int* offset, const int* edge_dst, const cap_t* residual_capacity, const int* reverse_index, int* height, const int* frontier_in, int* frontier_out, int* out_count) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= frontier_size) {
+      return;
+    }
+    int u = frontier_in[idx];
+
+    for (int e = offset[u]; e < offset[u + 1]; e++) {
+      int v = edge_dst[e];
+      //  v can step to u iff v->u has residual
+      if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
+        //  Confirm the claim atomically; only one thread may win
+        if (atomicCAS(&height[v], num_nodes, level + 1) == num_nodes) {
+          int pos = atomicAdd(out_count, 1);
+          frontier_out[pos] = v;
+        }
+      }
+    }
+  }
+
   //  Algorithm 3: Remove invalid steep edges
   //  If height[v] > height[u] + 1 for residual u->v => cancel it
   //  To remove parallel push races in GPU
@@ -126,6 +157,17 @@ namespace maxflow {
     }
     if (excess[u] > MAXFLOW_EPSILON && height[u] < num_nodes) {
       *flag = 1;
+    }
+  }
+
+  //  Profiling only: count active vertices instead of just flagging their existence (For data collection)
+  __global__ void gpu_count_active_kernel(int num_nodes, int source, int sink, const cap_t* excess, const int* height, int* counter) {
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= num_nodes || u == source || u == sink) {
+      return;
+    }
+    if (excess[u] > MAXFLOW_EPSILON && height[u] < num_nodes) {
+      atomicAdd(counter, 1);
     }
   }
 } // namespace maxflow
