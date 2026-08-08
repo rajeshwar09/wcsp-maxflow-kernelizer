@@ -26,6 +26,30 @@ RES="results/$STAMP"
 ARCH=sm_89
 GRB_SRC="third_party/wcsp-solver/src/LinearProgramSolver.cpp third_party/wcsp-solver/src/LinearProgramSolverGurobi.cpp"
 
+MIN_FREE_GB="${MIN_FREE_GB:-12}"
+
+preflight() {
+  echo "=== existing benchmark processes ==="
+  pgrep -a -f 'compare_kernels|run_benchmarks|e2e_cpu|e2e_gpu|e2e_gurobi|cut_audit' \
+    | grep -v "^$$ " || echo "  none"
+  echo "=== memory ==="
+  free -h
+  swapon --show || true
+  local avail
+  avail=$(free -g | awk '/^Mem:/{print $7}')
+  echo "=== available: ${avail} GB (minimum ${MIN_FREE_GB} GB) ==="
+  if [ "$avail" -lt "$MIN_FREE_GB" ]; then
+    echo "ABORT: not enough free RAM. Close other work or set MIN_FREE_GB lower."
+    exit 1
+  fi
+  local others
+  others=$(pgrep -c -f 'compare_kernels|e2e_cpu|e2e_gpu|e2e_gurobi' || true)
+  if [ "${others:-0}" -gt 0 ]; then
+    echo "ABORT: a benchmark process is already running. Wait for it to finish."
+    exit 1
+  fi
+}
+
 build() {
   echo "=== building ==="
   g++  -std=c++17 -O2 -I. apps/e2e_pipeline_test.cpp -o e2e_cpu -lopenblas
@@ -47,6 +71,15 @@ build() {
 #  Isolation matters: back-to-back runs share a warm page cache and a hot GPU,
 #  which showed up as ~6% timing variance in earlier measurements.
 settle() { sync; sleep 5; }
+
+#  Every heavy run is wrapped so peak RSS is recorded alongside the timing
+#  Runs strictly sequentially -- never background a benchmark on this machine
+timed() {
+  local log="$1"; shift
+  /usr/bin/time -v "$@" > "$log" 2>&1 || echo "  (FAILED or OOM-killed -- see $log)"
+  grep -E "Maximum resident set size|Elapsed \(wall clock\)" "$log" \
+    | sed 's/^/  /' || true
+}
 
 run_one() {
   local name="$1"

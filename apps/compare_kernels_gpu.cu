@@ -34,13 +34,23 @@ static void build(const char* path, ConstraintCompositeGraph<>::graph_t& g, std:
 int main(int argc, char** argv) {
   if (argc < 2) { std::cerr << "usage: " << argv[0] << " <file.wcsp>\n"; return 1; }
 
-  ConstraintCompositeGraph<>::graph_t g1, g2;
-  std::map<vid_t,bool> a_cpu, a_gpu, pre1, pre2;
-  build(argv[1], g1, pre1); a_cpu = pre1;
-  build(argv[1], g2, pre2); a_gpu = pre2;
-
-  maxflow::KernelizerMaxflow<>    kcpu; kcpu.kernelize(g1, a_cpu);
-  maxflow::KernelizerMaxflowGPU<> kgpu; kgpu.kernelize(g2, a_gpu);
+  std::map<vid_t,bool> a_cpu, a_gpu;
+  {
+    ConstraintCompositeGraph<>::graph_t g;
+    std::map<vid_t,bool> pre;
+    build(argv[1], g, pre);
+    a_cpu = pre;
+    maxflow::KernelizerMaxflow<> kcpu;
+    kcpu.kernelize(g, a_cpu);
+  }
+  {
+    ConstraintCompositeGraph<>::graph_t g;
+    std::map<vid_t,bool> pre;
+    build(argv[1], g, pre);
+    a_gpu = pre;
+    maxflow::KernelizerMaxflowGPU<> kgpu;
+    kgpu.kernelize(g, a_gpu);
+  }
 
   size_t only_cpu = 0, only_gpu = 0, agree = 0, conflict = 0;
   for (const auto& kv : a_cpu) {
