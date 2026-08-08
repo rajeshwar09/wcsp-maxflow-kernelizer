@@ -14,6 +14,7 @@
 //
 // Usage: ./cut_audit <file.wcsp>
 
+#include <cmath>
 #include <iostream>
 #include <fstream>
 #include <map>
@@ -156,6 +157,67 @@ int main(int argc, char** argv) {
     std::cout << "stranded excess: " << stranded << " vertices, "
               << stranded_amt << " units\n";
     std::cout << "net flow out of source = " << -ex[net.source] << "\n\n";
+  }
+
+  //  Integrality audit
+  //
+  //  WCSP costs are integers and toPolynomial() is a Mobius transform -- alternating
+  //  sums of integers -- so every double-cover capacity should be integral. By the
+  //  max-flow integrality theorem an integral maximum flow then exists, so every
+  //  residual, the flow value and the cut capacity should also come out as exact
+  //  integers. Any drift here means MAXFLOW_EPSILON is masking numerical error.
+  //  If there is none, cap_t can become int64_t and the epsilon can go away.
+  //
+  //  the 0.5 values NT reports are NOT fractionality in this sense: the
+  //  bipartite cut itself is integral (Koenig / total unimodularity). A 0.5 means
+  //  a variable's two copies landed on the SAME side, which is expected behaviour.
+  {
+    auto frac = [](cap_t x) {
+      cap_t r = x - std::floor(x + 0.5);
+      return r < 0 ? -r : r;
+    };
+    long cap_bad = 0, res_bad = 0, ex_bad = 0;
+    cap_t cap_worst = 0, res_worst = 0, ex_worst = 0;
+
+    for (edge_id_t e = 0; e < net.num_edges; e++) {
+      cap_t fc = frac(net.capacity[e]);
+      if (fc > 1e-9) { cap_bad++; if (fc > cap_worst) cap_worst = fc; }
+      cap_t fr = frac(net.residual_capacity[e]);
+      if (fr > 1e-9) { res_bad++; if (fr > res_worst) res_worst = fr; }
+    }
+    for (vertex_id_t v = 0; v < flow_n; v++) {
+      cap_t fe = frac(ex[v]);
+      if (fe > 1e-9) { ex_bad++; if (fe > ex_worst) ex_worst = fe; }
+    }
+
+    //  How many residuals are EXACTLY zero versus merely below the epsilon?
+    //  A saturated edge should be exactly 0 if the arithmetic is clean.
+    long exact_zero = 0, near_zero = 0;
+    for (edge_id_t e = 0; e < net.num_edges; e++) {
+      if (net.residual_capacity[e] == cap_t(0)) {
+        exact_zero++;
+      } else if (net.residual_capacity[e] <= MAXFLOW_EPSILON) {
+        near_zero++;
+      }
+    }
+
+    bool clean = (cap_bad + res_bad + ex_bad) == 0 && frac(F) <= 1e-9 && near_zero == 0;
+
+    std::cout << "=== INTEGRALITY AUDIT ===\n";
+    std::cout << "  non-integral capacities : " << cap_bad << " of " << net.num_edges
+              << "   (worst " << cap_worst << ")\n";
+    std::cout << "  non-integral residuals  : " << res_bad << " of " << net.num_edges
+              << "   (worst " << res_worst << ")\n";
+    std::cout << "  non-integral excess     : " << ex_bad << " of " << flow_n
+              << "   (worst " << ex_worst << ")\n";
+    std::cout << "  max-flow integral?      : " << (frac(F) <= 1e-9 ? "yes" : "NO") << "\n";
+    std::cout << "  residual exactly 0      : " << exact_zero << "\n";
+    std::cout << "  residual 0 < x <= eps   : " << near_zero
+              << (near_zero ? "   <-- epsilon is hiding drift" : "") << "\n";
+    std::cout << "  => " << (clean
+        ? "CLEAN: arithmetic is exact; cap_t can be int64_t and MAXFLOW_EPSILON removed"
+        : "DRIFT: floating point error present; keep MAXFLOW_EPSILON and investigate")
+              << "\n\n";
   }
 
   // --- STALE partition: heights as the solver left them ---
