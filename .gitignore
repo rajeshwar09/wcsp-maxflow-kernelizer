@@ -43,3 +43,5 @@ results.csv
 /e2e_gpu_prof
 /worklist_demo
 /compare_kernels
+results/
+data/bench/*.wcsp
