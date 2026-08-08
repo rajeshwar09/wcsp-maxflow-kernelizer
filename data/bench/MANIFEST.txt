@@ -1,0 +1,13 @@
+# benchmark suite manifest
+# name  N  M  seed  arity  sha256(16)  bytes
+01_10                    10       15   1001 mixed     f463be34b9eaefcb 1196
+02_500                  500      750   1002 mixed     3371cd8d8d92a2a5 75102
+03_1k                  1000     1500   1003 mixed     4fb5074db698fdd2 154657
+04_10k                10000    15000   1004 mixed     d837620d79fc88fc 1587183
+05_50k                50000    75000   1005 mixed     a91b72911d0de54e 8156878
+06_300k              300000   450000   1006 mixed     d4de5fe1d9a6722a 49931417
+07_300k_pairwise     300000   450000   1007 pairwise  17c397d82ef8e727 20230087
+08_500k              500000   750000   1008 mixed     e9263799d922fa0b 83589837
+09_500k_pairwise     500000   750000   1009 pairwise  cb134f6a86209ca5 33939338
+10_1M               1000000  1500000   1010 mixed     caa934ca46b366dc 167666632
+11_1M_pairwise      1000000  1500000   1011 pairwise  ee27ecd97727612b 68212831
