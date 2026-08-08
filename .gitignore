@@ -40,3 +40,6 @@ results.csv
 /e2e_cpu
 /e2e_gpu
 /e2e_pipeline_test_gpu
+/e2e_gpu_prof
+/worklist_demo
+/compare_kernels
