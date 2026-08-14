@@ -45,3 +45,10 @@ results.csv
 /compare_kernels
 results/
 data/bench/*.wcsp
+
+# Log folder
+/log
+log/
+/e2e_nokern
+/kmf_test
+/e2e_gurobi
