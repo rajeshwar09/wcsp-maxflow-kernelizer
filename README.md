@@ -124,27 +124,199 @@ handler. Use `-t` to put a time limit on very large runs.
 ./scripts/run_test.sh --no-build data/bench/04_10k.wcsp
 ```
 
+### Common commands
+
+| Goal | Command |
+|---|---|
+| Everything (correctness + timing + profile) | `./scripts/run_test.sh data/bench/<file>.wcsp` |
+| Graph and node sizes only — how big the CCG and double cover get, no solving | `./scripts/run_test.sh --graph-only data/bench/<file>.wcsp` |
+| Timing only, stable numbers for a results table | `./scripts/run_test.sh -r 3 --no-audit --no-compare --no-profile data/bench/<file>.wcsp` |
+| Correctness only — min-cut validity, integrality, kernel agreement | `./scripts/run_test.sh --no-time --no-profile data/bench/<file>.wcsp` |
+| GPU kernel breakdown only — which CUDA kernel dominates | `./scripts/run_test.sh -a gpu --no-audit --no-compare --no-time data/bench/<file>.wcsp` |
+| CPU vs GPU only, no Gurobi | `./scripts/run_test.sh -a cpu,gpu -r 3 data/bench/<file>.wcsp` |
+| Max-flow vs Gurobi kernel quality | `./scripts/run_test.sh --no-audit --no-time --no-profile data/bench/<file>.wcsp` |
+| Single approach, e.g. just the GPU | `./scripts/run_test.sh -a gpu -r 3 data/bench/<file>.wcsp` |
+| Large instance, safe — skip the expensive checks, cap the runtime | `./scripts/run_test.sh --no-audit --no-compare -t 7200 -r 2 data/bench/<file>.wcsp` |
+| Re-run without recompiling | `./scripts/run_test.sh --no-build data/bench/<file>.wcsp` |
+| `kernel_cycles` parameter sweep | `for k in 5 20 100 500; do ./scripts/run_test.sh --no-build --no-audit --no-compare -a gpu -n sweep_kc$k --kernel-cycles $k data/bench/<file>.wcsp; done` |
+| Compare the two GPU BFS variants | `./scripts/run_test.sh -a gpu --no-audit --no-compare -n bfs_topo data/bench/<file>.wcsp`<br>`./scripts/run_test.sh -a gpu --no-audit --no-compare --no-build -n bfs_front --bfs frontier data/bench/<file>.wcsp` |
+| Machine with no GPU | `./scripts/run_test.sh -a cpu,gurobi data/bench/<file>.wcsp` |
+| Machine with no Gurobi | `./scripts/run_test.sh -a cpu,gpu data/bench/<file>.wcsp` |
+| Custom log name and location | `./scripts/run_test.sh -n experiment_A -o results/aug14 data/bench/<file>.wcsp` |
+| Batch over several instances (one at a time — never in parallel) | `for f in data/bench/0*.wcsp; do ./scripts/run_test.sh --no-build "$f"; done` |
+
+Which flags cost the most time. The audit and the kernel comparisons each run
+a full kernelization of their own, so `--no-audit --no-compare` can cut total
+runtime by well over half. Use the full set when checking correctness, and the
+timing-only recipe when producing numbers for a table.
+
+Repeats. Run-to-run variance is around 6%, so use `-r 3` or more for any
+figure you intend to quote.
+
 ---
 
 ## 4. Reading the log
 
-The log ends with a **SUMMARY** section collecting the important lines.
+A log has nine sections, in the order they run.
 
-| Line | Meaning |
-|---|---|
-| `CCG vertex count` | size of the constraint composite graph |
-| `double cover: N nodes, M half-edges` | size of the flow network actually solved |
-| `Remnant s=..., resolved=N` | how many variables the kernelizer fixed |
-| `VALID MIN-CUT? : saturated` | the cut really is a minimum cut |
-| `=> CLEAN` | all arithmetic stayed exactly integral |
-| `decided by both, OPPOSITE: 0` | **must be 0** — a non-zero value means a kernelizer is wrong |
-| `[KernelizerMaxflow] 41.9 s` | time in the kernelization stage alone |
-| `[resource] wall … peak RSS … KB` | wall time and peak memory of that step |
-| `global relabel: … (99.6%)` | share of GPU time per kernel |
+### TEST and SYSTEM CONFIGURATION
 
-Stages named `[parse DIMACS]`, `[toPolynomial all]`, `[ccg.addPolynomial]`,
-`[ccg.simplify]` and `[getGraph copy]` are shared by all three approaches, so
-only the `[Kernelizer…]` line should be used when comparing them.
+Identifies the run: input file, its SHA-256, the machine, compiler and GPU, and
+the git commit the binaries were built from. This makes any result traceable
+back to exact code and exact input.
+
+### RUN SETTINGS
+
+Every flag in effect, so the log explains itself without needing the command
+that produced it. `cuda arch : sm_XX` confirms the GPU was auto-detected;
+`gurobi usable : yes/no` confirms whether the LP baseline was available.
+
+### BUILD
+
+The exact compile commands used. If a build step fails, the run stops here.
+
+### GRAPH AND NODE INFORMATION
+
+How large the problem actually becomes:
+
+```
+Post-simplify vars: <V>, type1 aux: <A1>, type2 aux: <A2>
+CCG vertex count (post-simplify, pre-kernelize): <n>
+double cover: <2n+2> nodes, <E> half-edges
+```
+
+The WCSP variables become a much larger constraint composite graph, because
+constraints of arity 3 and above need auxiliary vertices. Max-flow then runs on
+the double cover, which has `2n+2` nodes for `n` CCG vertices. Expect roughly a
+13× blow-up on mixed-arity instances and roughly 3× on pairwise ones.
+
+### MIN-CUT VALIDITY AND INTEGRALITY AUDIT
+
+Two independent correctness checks.
+
+**Is the cut really a minimum cut?** For each candidate rule:
+
+```
+cut capacity         : <C>
+max-flow value       : <F>
+capacity - maxflow   : 0
+crossing residual    : 0 edges, 0 units
+VALID MIN-CUT?       : saturated
+```
+
+`capacity - maxflow` must be `0` and `crossing residual` must be `0 edges`.
+Several rules are checked because the minimum cut is generally **not unique** —
+different cuts can share the same minimum capacity while deciding different
+variables.
+
+**Is the arithmetic exact?**
+
+```
+non-integral capacities : 0 of <E>
+non-integral residuals  : 0 of <E>
+residual 0 < x <= eps   : 0
+max-flow integral?      : yes
+=> CLEAN
+```
+
+All WCSP costs are integers, so by the max-flow integrality theorem every
+capacity, residual and flow value should also be an exact integer. `CLEAN` means
+they are, and that no value is hiding inside the floating-point tolerance.
+`DRIFT` would mean floating-point error is present and needs investigating.
+
+`NT decided TOTAL` counts CCG vertices, while `resolved=` further down counts
+original WCSP variables. Most CCG vertices are auxiliary and correspond to no
+variable, and `resolved=` also includes variables already fixed by
+`ccg.simplify()` before kernelization. The two numbers are not meant to match.
+
+### KERNEL AGREEMENT
+
+Does every kernelizer decide the same variables the same way?
+
+```
+resolved by CPU max-flow : <K>
+resolved by GPU max-flow : <K>
+decided by both, OPPOSITE: 0
+```
+
+```
+decided by max-flow      : <K>
+decided by Gurobi        : <L>
+decided by max-flow only : 0
+decided by Gurobi only   : <L-K>
+decided by both, OPPOSITE: 0
+```
+
+`OPPOSITE` must be 0. Anything else means a kernelizer assigned a variable
+the wrong value, which is a correctness failure.
+
+`Gurobi only` being non-zero is expected and is not an error: the LP
+relaxation has several optimal solutions, and Gurobi lands on one that fixes a
+few more variables. `max-flow only : 0` means the max-flow kernel is a strict
+subset of the LP kernel — it never decides anything the LP does not.
+
+### TIMED RUNS
+
+Each approach runs the same pipeline. Only the `[Kernelizer…]` line differs
+between them; every other stage is shared, so compare only that line:
+
+```
+[parse DIMACS]        <t1> s     <- shared by all approaches
+[toPolynomial all]    <t2> s     <- shared
+[ccg.addPolynomial]   <t3> s     <- shared
+[ccg.simplify]        <t4> s     <- shared
+[getGraph copy]       <t5> s     <- shared
+[KernelizerMaxflow]   <t6> s     <- the part being compared
+TOTAL: <sum> s
+Remnant s=<S>, resolved=<K>
+```
+
+`Remnant s` is the constant part of the objective. It is identical across all
+approaches — a useful cross-check that they all solved the same problem.
+
+Each step is followed by a resource line:
+
+```
+[resource] wall <W> s | peak RSS <R> KB | cpu <P>%
+```
+
+`peak RSS` is peak physical memory in kilobytes; divide by 1,048,576 for GiB.
+`cpu 100%` means single-threaded. Note that the GPU version uses roughly the same
+host memory as the CPU version — the graph is built in ordinary RAM either way,
+and only the arithmetic moves to the GPU.
+
+### GPU PER-KERNEL PROFILE
+
+Where GPU time actually goes:
+
+```
+outer iterations   : <I>
+BFS levels (total) : <B>
+check-active  : <ta> s  ( <pa>%)
+global relabel: <tb> s  ( <pb>%)
+push-relabel  : <tc> s  ( <pc>%)
+remove-invalid: <td> s  ( <pd>%)
+```
+
+Divide `BFS levels` by `outer iterations` to get levels per global relabel. BFS
+levels must run one after another, so a higher number means less opportunity for
+parallelism — this is why sparse, stringy graphs (pairwise instances) do worse on
+the GPU than dense ones.
+
+The active-vertex list shows how many vertices still had work in each outer
+iteration. It starts high and decays; a fast decay means most later iterations
+are doing very little.
+
+### SUMMARY
+
+The key lines from every section, gathered at the end. **Read this first.**
+Check in this order:
+
+1. `failed steps : 0`
+2. every `OPPOSITE : 0`
+3. `=> CLEAN`
+4. `VALID MIN-CUT? : saturated`
+5. the `[Kernelizer…]` times and the `peak RSS` values
 
 ---
 
