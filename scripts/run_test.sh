@@ -23,6 +23,7 @@ DO_BUILD=1
 DO_AUDIT=1
 DO_COMPARE=1
 DO_PROFILE=1
+DO_TIME=1
 ARCH_OVERRIDE=""
 TIMEOUT=0             # 0 = no limit
 KCYCLES=""            # empty = solver's own heuristic
@@ -51,6 +52,8 @@ Options:
   --no-audit            Skip the min-cut validity and integrality check
   --no-compare          Skip the kernel agreement comparisons
   --no-profile          Skip the GPU per-kernel profiling run
+  --no-time             Skip the timed runs (correctness checks only)
+  --graph-only          Only report graph and node sizes, then stop
   -q, --quiet           Less console output (the log is unchanged)
   -h, --help            Show this message
 
@@ -79,6 +82,8 @@ while [ $# -gt 0 ]; do
     --no-audit)         DO_AUDIT=0; shift ;;
     --no-compare)       DO_COMPARE=0; shift ;;
     --no-profile)       DO_PROFILE=0; shift ;;
+    --no-time)          DO_TIME=0; shift ;;
+    --graph-only)       DO_AUDIT=0; DO_COMPARE=0; DO_PROFILE=0; DO_TIME=0; shift ;;
     -q|--quiet)         QUIET=1; shift ;;
     -h|--help)          usage; exit 0 ;;
     -*)                 echo "unknown option: $1"; usage; exit 1 ;;
@@ -151,6 +156,7 @@ echo "repeats        : $REPEATS"
 echo "audit          : $([ $DO_AUDIT = 1 ] && echo on || echo off)"
 echo "compare        : $([ $DO_COMPARE = 1 ] && echo on || echo off)"
 echo "gpu profile    : $([ $DO_PROFILE = 1 ] && echo on || echo off)"
+echo "timed runs     : $([ $DO_TIME = 1 ] && echo on || echo off)"
 echo "timeout        : $([ "$TIMEOUT" = 0 ] && echo none || echo "${TIMEOUT}s")"
 echo "kernel_cycles  : ${KCYCLES:-<solver heuristic |E|/|V|>}"
 echo "bfs variant    : ${BFSMODE:-topology (default)}"
@@ -279,27 +285,29 @@ fi
 
 # --------------------------------------------------------------- timings
 
-say "TIMED RUNS"
-echo "Each run prints per-stage times. The [Kernelizer...] line is the"
-echo "kernelization stage alone; the other stages are shared by all approaches."
+if [ "$DO_TIME" = "1" ]; then
+  say "TIMED RUNS"
+  echo "Each run prints per-stage times. The [Kernelizer...] line is the"
+  echo "kernelization stage alone; the other stages are shared by all approaches."
 
-export ${KCYCLES:+MAXFLOW_KERNEL_CYCLES=$KCYCLES}
-export ${BFSMODE:+MAXFLOW_BFS=$BFSMODE}
+  export ${KCYCLES:+MAXFLOW_KERNEL_CYCLES=$KCYCLES}
+  export ${BFSMODE:+MAXFLOW_BFS=$BFSMODE}
 
-for r in $(seq 1 "$REPEATS"); do
-  if want cpu; then
-    tick "CPU run $r/$REPEATS"
-    measure "CPU max-flow kernelizer (run $r of $REPEATS)" ./e2e_cpu "$INPUT"
-  fi
-  if want gpu && [ $HAVE_GPU = 1 ]; then
-    tick "GPU run $r/$REPEATS"
-    measure "GPU max-flow kernelizer (run $r of $REPEATS)" ./e2e_gpu "$INPUT"
-  fi
-  if want gurobi && [ $HAVE_GUROBI = 1 ]; then
-    tick "Gurobi run $r/$REPEATS"
-    measure "Gurobi LP kernelizer (run $r of $REPEATS)" ./e2e_gurobi "$INPUT"
-  fi
-done
+  for r in $(seq 1 "$REPEATS"); do
+    if want cpu; then
+      tick "CPU run $r/$REPEATS"
+      measure "CPU max-flow kernelizer (run $r of $REPEATS)" ./e2e_cpu "$INPUT"
+    fi
+    if want gpu && [ $HAVE_GPU = 1 ]; then
+      tick "GPU run $r/$REPEATS"
+      measure "GPU max-flow kernelizer (run $r of $REPEATS)" ./e2e_gpu "$INPUT"
+    fi
+    if want gurobi && [ $HAVE_GUROBI = 1 ]; then
+      tick "Gurobi run $r/$REPEATS"
+      measure "Gurobi LP kernelizer (run $r of $REPEATS)" ./e2e_gurobi "$INPUT"
+    fi
+  done
+fi
 
 # ------------------------------------------------------- gpu kernel profile
 
@@ -327,7 +335,7 @@ say "SUMMARY"
   grep -h -E "^Remnant s=" "$LOG" | sort -u
   echo
   echo "-- correctness --"
-  grep -h -E "VALID MIN-CUT\?|=> (CLEAN|DRIFT)|OPPOSITE|resolved by (CPU|GPU)|decided by" "$LOG"
+  grep -h -E "VALID MIN-CUT\?|=> (CLEAN|DRIFT)|^  (decided|resolved) by" "$LOG"
   echo
   echo "-- stage timings --"
   grep -h -E "^\[(parse|toPolynomial|ccg|getGraph|Kernelizer)" "$LOG"
