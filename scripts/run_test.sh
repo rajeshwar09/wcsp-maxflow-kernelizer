@@ -27,7 +27,6 @@ DO_TIME=1
 ARCH_OVERRIDE=""
 TIMEOUT=0             # 0 = no limit
 KCYCLES=""            # empty = solver's own heuristic
-BFSMODE=""            # empty = default topology-driven BFS
 QUIET=0
 
 usage() {
@@ -46,7 +45,6 @@ Options:
 
   --arch sm_XX          Force the CUDA architecture instead of auto-detecting
   --kernel-cycles N     Override the push-relabel kernel_cycles parameter
-  --bfs MODE            GPU BFS variant: topology (default) or frontier
 
   --no-build            Use existing binaries, do not compile
   --no-audit            Skip the min-cut validity and integrality check
@@ -77,7 +75,6 @@ while [ $# -gt 0 ]; do
     -t|--timeout)       TIMEOUT="$2"; shift 2 ;;
     --arch)             ARCH_OVERRIDE="$2"; shift 2 ;;
     --kernel-cycles)    KCYCLES="$2"; shift 2 ;;
-    --bfs)              BFSMODE="$2"; shift 2 ;;
     --no-build)         DO_BUILD=0; shift ;;
     --no-audit)         DO_AUDIT=0; shift ;;
     --no-compare)       DO_COMPARE=0; shift ;;
@@ -148,7 +145,7 @@ echo "gpu memory     : $(nvidia-smi --query-gpu=memory.total --format=csv,nohead
 echo "gpu driver     : $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null)"
 echo "GUROBI_HOME    : ${GUROBI_HOME:-<not set>}"
 echo "git commit     : $(git rev-parse --short HEAD 2>/dev/null || echo '<not a git repo>')"
-echo "git state      : $(git status --porcelain 2>/dev/null | grep -c '^ M' || echo 0) modified file(s)"
+echo "git state      : $(git status --porcelain 2>/dev/null | grep -c '^ M'; true) modified file(s)"
 
 say "RUN SETTINGS"
 echo "approaches     : $APPROACH"
@@ -159,7 +156,7 @@ echo "gpu profile    : $([ $DO_PROFILE = 1 ] && echo on || echo off)"
 echo "timed runs     : $([ $DO_TIME = 1 ] && echo on || echo off)"
 echo "timeout        : $([ "$TIMEOUT" = 0 ] && echo none || echo "${TIMEOUT}s")"
 echo "kernel_cycles  : ${KCYCLES:-<solver heuristic |E|/|V|>}"
-echo "bfs variant    : ${BFSMODE:-topology (default)}"
+echo "profile only   : $([ $DO_TIME = 0 ] && [ $DO_PROFILE = 1 ] && echo yes || echo no)"
 
 #  Detect what this machine can actually do.
 HAVE_GPU=0; ARCH=""
@@ -285,13 +282,15 @@ fi
 
 # --------------------------------------------------------------- timings
 
+#  Set BEFORE the timed runs and OUTSIDE the DO_TIME block, so that --no-time
+#  still applies these to the profiling run below. Guarded with [ -n ... ]
+#  because a bare `export` prints the entire environment.
+[ -n "$KCYCLES" ] && export MAXFLOW_KERNEL_CYCLES="$KCYCLES"
+
 if [ "$DO_TIME" = "1" ]; then
   say "TIMED RUNS"
   echo "Each run prints per-stage times. The [Kernelizer...] line is the"
   echo "kernelization stage alone; the other stages are shared by all approaches."
-
-  export ${KCYCLES:+MAXFLOW_KERNEL_CYCLES=$KCYCLES}
-  export ${BFSMODE:+MAXFLOW_BFS=$BFSMODE}
 
   for r in $(seq 1 "$REPEATS"); do
     if want cpu; then
@@ -341,7 +340,7 @@ say "SUMMARY"
   grep -h -E "^\[(parse|toPolynomial|ccg|getGraph|Kernelizer)" "$LOG"
   echo
   echo "-- gpu kernels --"
-  grep -h -E "outer iterations|BFS levels|global relabel|push-relabel|remove-invalid|check-active|measured total" "$LOG"
+  grep -h -E "bfs variant|outer iterations|BFS levels|global relabel|push-relabel|remove-invalid|check-active|measured total|per level" "$LOG"
   echo
   echo "-- resources --"
   grep -h -E "^\[resource\]" "$LOG"
