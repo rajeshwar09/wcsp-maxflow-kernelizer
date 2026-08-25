@@ -18,6 +18,9 @@ third_party/cuda
 /kernelizer_maxflow_test
 /compare_kernels
 /e2e_pipeline_test_gurobi
+e2e_solve
+e2e_solve_gpu
+mincut_lattice
 
 # Editor/OS files
 .DS_Store
@@ -45,6 +48,7 @@ results.csv
 /compare_kernels
 results/
 data/bench/*.wcsp
+data/bench/*
 
 # Log folder
 /log
