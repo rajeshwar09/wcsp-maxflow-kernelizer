@@ -35,6 +35,9 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <cstdint>
+
+#include "src/integration/perturbation.h"
 
 #include "third_party/wcsp-solver/src/global.h"
 #include "third_party/wcsp-solver/src/RunningTime.h"
@@ -73,6 +76,10 @@ static void usage(const char* prog) {
     << "  --kernelizer none|cpu|gpu|lp   kernelizer to use        (default: cpu)\n"
     << "  --solver     ilp|mp|none       remnant solver           (default: ilp)\n"
     << "  --max-rounds N                 max kernelization rounds (default: 100)\n"
+    << "  --perturb off|int|real         weight tie-breaking      (default: off)\n"
+    << "  --spread K                     int mode: offsets 1..K   (default: 8)\n"
+    << "  --delta D                      real mode: 0 = auto 1/2n (default: auto)\n"
+    << "  --seed S                       perturbation seed        (default: 1)\n"
     << "  --time-limit SEC               solver time limit        (default: none)\n"
     << "  -h, --help                     this message\n\n"
     << "  none : skip kernelization entirely -- the baseline the others must match\n"
@@ -88,6 +95,10 @@ int main(int argc, char** argv) {
   std::string kern = "cpu";
   std::string solver = "ilp";
   long max_rounds = 100;
+  std::string perturb = "off";
+  long   pspread = 8;
+  double pdelta = 0.0;
+  std::uint64_t pseed = 1;
   double time_limit = -1.0;
   const char* path = nullptr;
 
@@ -95,6 +106,10 @@ int main(int argc, char** argv) {
     if (!std::strcmp(argv[i], "--kernelizer") && i + 1 < argc)      kern = argv[++i];
     else if (!std::strcmp(argv[i], "--solver") && i + 1 < argc)     solver = argv[++i];
     else if (!std::strcmp(argv[i], "--max-rounds") && i + 1 < argc) max_rounds = std::atol(argv[++i]);
+    else if (!std::strcmp(argv[i], "--perturb") && i + 1 < argc)    perturb = argv[++i];
+    else if (!std::strcmp(argv[i], "--spread") && i + 1 < argc)     pspread = std::atol(argv[++i]);
+    else if (!std::strcmp(argv[i], "--delta") && i + 1 < argc)      pdelta = std::atof(argv[++i]);
+    else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc)       pseed = std::strtoull(argv[++i], nullptr, 10);
     else if (!std::strcmp(argv[i], "--time-limit") && i + 1 < argc) time_limit = std::atof(argv[++i]);
     else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
     else if (argv[i][0] == '-') { std::cerr << "unknown option: " << argv[i] << "\n"; usage(argv[0]); return 1; }
@@ -107,6 +122,18 @@ int main(int argc, char** argv) {
   }
   if (solver != "ilp" && solver != "mp" && solver != "none") {
     std::cerr << "bad --solver: " << solver << "\n"; return 1;
+  }
+  
+  maxflow::perturb_config pcfg_base;
+  if (!maxflow::parse_perturb_mode(perturb, pcfg_base.mode)) {
+    std::cerr << "bad --perturb: " << perturb << "\n"; return 1;
+  }
+  pcfg_base.spread = pspread;
+  pcfg_base.delta  = pdelta;
+  pcfg_base.seed   = pseed;
+
+  if (pcfg_base.mode != maxflow::perturb_mode::off && kern == "lp") {
+    std::cerr << "note: --perturb has no effect on the lp kernelizer (it is the baseline)\n";
   }
 #ifndef USE_GPU
   if (kern == "gpu") { std::cerr << "this binary was built without -DUSE_GPU\n"; return 3; }
@@ -133,6 +160,9 @@ int main(int argc, char** argv) {
   std::cout << "[e2e] kernelizer        : " << kern << "\n";
   std::cout << "[e2e] solver            : " << solver << "\n";
   std::cout << "[e2e] max rounds        : " << max_rounds << "\n";
+  std::cout << "[e2e] perturb           : " << maxflow::perturb_mode_name(pcfg_base.mode);
+  if (pcfg_base.mode != maxflow::perturb_mode::off) std::cout << "  seed=" << pseed;
+  std::cout << "\n";
 
   auto t_all0 = clk::now();
 
@@ -188,13 +218,19 @@ int main(int argc, char** argv) {
       prev = assignments.size();
       auto k0 = clk::now();
 
+      //  A fresh perturbation each round. This is the point of iterating: with
+      //  unchanged weights round 2 sees an identical graph and the fixed point is immediate
+      maxflow::perturb_config pc = pcfg_base;
+      pc.seed    = pcfg_base.seed + static_cast<std::uint64_t>(i);
+      pc.verbose = (i == 1);
+
       if (kern == "cpu") {
-        maxflow::KernelizerMaxflow<> k;
+        maxflow::KernelizerMaxflow<> k(pc);
         k.kernelize(g, assignments);
       }
 #ifdef USE_GPU
       else if (kern == "gpu") {
-        maxflow::KernelizerMaxflowGPU<> k;
+        maxflow::KernelizerMaxflowGPU<> k(pc);
         k.kernelize(g, assignments);
       }
 #endif
