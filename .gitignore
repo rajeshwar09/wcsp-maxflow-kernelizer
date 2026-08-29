@@ -21,6 +21,7 @@ third_party/cuda
 e2e_solve
 e2e_solve_gpu
 mincut_lattice
+/e2e_solve_np
 
 # Editor/OS files
 .DS_Store
