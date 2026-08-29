@@ -24,6 +24,8 @@
 
 #include "src/gpu/maxflow_gpu_topology.h"
 
+#include "src/integration/perturbation.h"
+
 namespace maxflow {
 
   //  KernelizerMaxflowGPU class
@@ -36,6 +38,10 @@ namespace maxflow {
   template <class CCG = ConstraintCompositeGraph<>>
   class KernelizerMaxflowGPU : public Kernelizer<CCG> {
     public:
+
+      KernelizerMaxflowGPU() : pcfg_() {}
+      explicit KernelizerMaxflowGPU(const perturb_config& cfg) : pcfg_(cfg) {}
+
       //  kernelize()
       //
       //  Same signature as KernelizerMaxflow::kernelize() and KernelizerLinearProgramming::kernelize()
@@ -92,10 +98,21 @@ namespace maxflow {
         vertex_id_t flow_source = 0;        //  source ID
         vertex_id_t flow_sink = 2 * n + 1;  //  sink ID
 
-        //  Compute INF = 1 + sum of all weights
+        //  Tie-breaking perturbation
+        //  weights[i] is the capacity actually used for CCG vertex i with perturbation off it equals the original weight exactly.
+        cap_t total_w = cap_t(0);
+        for (int i = 0; i < n; i++) {
+          total_w += static_cast<cap_t>(vertex_weight_map[ccg_vertices[i]]);
+        }
+
+        perturber pert(pcfg_, n, total_w);
+
+        //  Compute INF = 1 + sum of all (perturbed) weights
+        std::vector<cap_t> weights(n);
         cap_t inf_cap = cap_t(1);
         for (int i = 0; i < n; i++) {
-          inf_cap += static_cast<cap_t>(vertex_weight_map[ccg_vertices[i]]);
+          weights[i] = pert.weight(i, static_cast<cap_t>(vertex_weight_map[ccg_vertices[i]]));
+          inf_cap += weights[i];
         }
 
         //  collect directed edges from flow network
@@ -104,7 +121,7 @@ namespace maxflow {
 
         //  source and sink edges (1 per CCG vertex)
         for (int i = 0; i < n; i++) {
-          cap_t w = static_cast<cap_t>(vertex_weight_map[ccg_vertices[i]]);
+          cap_t w = weights[i];
 
           int left_copy = i + 1;
           int right_copy = n + i + 1;
@@ -197,6 +214,10 @@ namespace maxflow {
           remove_vertex(v, g);
         }
       }
+    
+    private: 
+      perturb_config pcfg_;
+
   };
 
 } // namespace maxflow
