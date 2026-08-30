@@ -4,10 +4,11 @@
 // cut_audit already showed that the max-flow cut is a genuine minimum cut, and that different min-cuts decide
 // different amounts (SEEDED 0, FRESH 0, STALE 5 on d_m2000)
 //
-// Picard and Queyranne showed that the minimum cuts of a flow network correspond exactly to the closed sets of the DAG of strongly connected
-// components of the residual graph. That gives a sharp test:
+// In the residual graph left behind by the max-flow, two nodes in the same strongly connected component are each reachable from the other along edges that still have capacity
+// A cut placing them on opposite sides would leave a residual edge crossing it, which no minimum cut can do
+// That gives a test:
 //
-//   for a CCG vertex v with copies v_L and v_R in the double cover,
+//   for a CCG vertex v with copies v_L and v_R in the double cover
 //     SCC(v_L) == SCC(v_R)  ->  they are on the same side in EVERY min-cut, so v is undecidable by any min-cut method
 //     SCC(v_L) != SCC(v_R)  ->  SOME min-cut separates them, so v is decidable in principle
 //
@@ -26,6 +27,8 @@
 #include <queue>
 #include <stack>
 #include <vector>
+#include <memory>
+#include <string>
 
 #include "third_party/wcsp-solver/src/WCSPInstance.h"
 #include "third_party/wcsp-solver/src/ConstraintCompositeGraph.h"
@@ -96,11 +99,48 @@ static void strongly_connected(const flow_network<cap_t>& net, std::vector<int>&
 }
 
 int main(int argc, char** argv) {
-  if (argc < 2) { std::cerr << "usage: " << argv[0] << " <file.wcsp>\n"; return 1; }
+  if (argc < 2) {
+    std::cerr << "usage: " << argv[0] << " [--format d|u|auto] <file.wcsp|file.uai>\n";
+    return 1;
+  }
 
-  std::ifstream in(argv[1]);
-  if (!in) { std::cerr << "cannot open " << argv[1] << "\n"; return 2; }
-  WCSPInstance<> inst(in, WCSPInstance<>::Format::DIMACS);
+  //  Format is chosen by extension unless --format overrides it.
+  std::string fmt = "auto";
+  const char* path = nullptr;
+  for (int i = 1; i < argc; i++) {
+    if (std::string(argv[i]) == "--format" && i + 1 < argc) fmt = argv[++i];
+    else path = argv[i];
+  }
+  if (path == nullptr) { std::cerr << "no input file given\n"; return 1; }
+
+  WCSPInstance<>::Format fformat = WCSPInstance<>::Format::DIMACS;
+  {
+    std::string f = fmt;
+    if (f == "auto") {
+      std::string p(path);
+      f = (p.size() >= 4 && p.compare(p.size() - 4, 4, ".uai") == 0) ? "u" : "d";
+    }
+    if (f == "u" || f == "uai")
+      fformat = WCSPInstance<>::Format::UAI;
+    else if (f == "d" || f == "dimacs" || f == "wcsp") 
+      fformat = WCSPInstance<>::Format::DIMACS;
+    else { 
+      std::cerr << "bad --format: " << fmt << "\n"; return 1;
+    }
+  }
+
+  std::ifstream in(path);
+  if (!in) { std::cerr << "cannot open " << path << "\n"; return 2; }
+
+  //  Non-Boolean domains cannot be expressed as a CCG. Skip rather than terminate.
+  std::unique_ptr<WCSPInstance<>> instp;
+  try {
+    instp.reset(new WCSPInstance<>(in, fformat));
+  } catch (const std::domain_error& e) {
+    std::cout << "skipped -- " << e.what() << "\n";
+    return 5;
+  }
+  WCSPInstance<>& inst = *instp;
   ConstraintCompositeGraph<> ccg;
   WCSPInstance<>::constraint_t::Polynomial p;
   for (const auto& c : inst.getConstraints()) c.toPolynomial(p);
@@ -155,7 +195,7 @@ int main(int argc, char** argv) {
   cap_t F = solver.solve();
 
   std::cout << "=== INSTANCE ===\n";
-  std::cout << "  file                 : " << argv[1] << "\n";
+  std::cout << "  file                 : " << path << "\n";
   std::cout << "  CCG vertices n       : " << n << "\n";
   std::cout << "  double cover nodes   : " << flow_n << "\n";
   std::cout << "  double cover edges   : " << net.num_edges << "\n";

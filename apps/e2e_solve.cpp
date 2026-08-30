@@ -36,6 +36,7 @@
 #include <map>
 #include <string>
 #include <cstdint>
+#include <memory>
 
 #include "src/integration/perturbation.h"
 
@@ -81,6 +82,7 @@ static void usage(const char* prog) {
     << "  --delta D                      real mode: 0 = auto 1/2n (default: auto)\n"
     << "  --seed S                       perturbation seed        (default: 1)\n"
     << "  --time-limit SEC               solver time limit        (default: none)\n"
+    << "  --format     d|u|auto          input format             (default: auto)\n"
     << "  -h, --help                     this message\n\n"
     << "  none : skip kernelization entirely -- the baseline the others must match\n"
     << "  cpu  : max-flow kernelizer, CPU push-relabel\n"
@@ -100,6 +102,7 @@ int main(int argc, char** argv) {
   double pdelta = 0.0;
   std::uint64_t pseed = 1;
   double time_limit = -1.0;
+  std::string format = "auto";
   const char* path = nullptr;
 
   for (int i = 1; i < argc; i++) {
@@ -111,6 +114,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--delta") && i + 1 < argc)      pdelta = std::atof(argv[++i]);
     else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc)       pseed = std::strtoull(argv[++i], nullptr, 10);
     else if (!std::strcmp(argv[i], "--time-limit") && i + 1 < argc) time_limit = std::atof(argv[++i]);
+    else if (!std::strcmp(argv[i], "--format") && i + 1 < argc)     format = argv[++i];
     else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
     else if (argv[i][0] == '-') { std::cerr << "unknown option: " << argv[i] << "\n"; usage(argv[0]); return 1; }
     else path = argv[i];
@@ -122,6 +126,20 @@ int main(int argc, char** argv) {
   }
   if (solver != "ilp" && solver != "mp" && solver != "none") {
     std::cerr << "bad --solver: " << solver << "\n"; return 1;
+  }
+
+  //  Input format. `auto` decides from the extension: .uai -> UAI, else DIMACS.
+  //  The benchmark artifact mixes both, so batch runs depend on this.
+  WCSPInstance<>::Format fformat = WCSPInstance<>::Format::DIMACS;
+  {
+    std::string f = format;
+    if (f == "auto") {
+      std::string p(path);
+      f = (p.size() >= 4 && p.compare(p.size() - 4, 4, ".uai") == 0) ? "u" : "d";
+    }
+    if (f == "u" || f == "uai")                        fformat = WCSPInstance<>::Format::UAI;
+    else if (f == "d" || f == "dimacs" || f == "wcsp") fformat = WCSPInstance<>::Format::DIMACS;
+    else { std::cerr << "bad --format: " << format << " (expected d, u or auto)\n"; return 1; }
   }
   
   maxflow::perturb_config pcfg_base;
@@ -157,6 +175,7 @@ int main(int argc, char** argv) {
 
   std::cout << std::setprecision(std::numeric_limits<double>::digits10 + 1);
   std::cout << "[e2e] instance          : " << path << "\n";
+  std::cout << "[e2e] format            : " << (fformat == WCSPInstance<>::Format::UAI ? "uai" : "dimacs") << "\n";
   std::cout << "[e2e] kernelizer        : " << kern << "\n";
   std::cout << "[e2e] solver            : " << solver << "\n";
   std::cout << "[e2e] max rounds        : " << max_rounds << "\n";
@@ -170,7 +189,17 @@ int main(int argc, char** argv) {
   std::ifstream in(path);
   if (!in) { std::cerr << "cannot open " << path << "\n"; return 2; }
   auto t0 = clk::now();
-  WCSPInstance<> instance(in, WCSPInstance<>::Format::DIMACS);
+  //  The CCG needs Boolean variables. Both loaders throw domain_error on anything
+  //  wider, and 70.8 % of the benchmark artifact is non-Boolean. Left uncaught this
+  //  reaches terminate() and kills the whole batch, so skip cleanly with rc=5.
+  std::unique_ptr<WCSPInstance<>> instp;
+  try {
+    instp.reset(new WCSPInstance<>(in, fformat));
+  } catch (const std::domain_error& e) {
+    std::cout << "[e2e] SKIP              : " << e.what() << "\n";
+    return 5;
+  }
+  WCSPInstance<>& instance = *instp;
   auto t1 = clk::now();
   std::cout << "[stage] parse           : " << secs(t0, t1) << " s\n";
 
