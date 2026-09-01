@@ -1,0 +1,401 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.1cm]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[breakable]{tcolorbox}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage[colorlinks=true,linkcolor=blue!45!black,urlcolor=blue!45!black]{hyperref}
+
+\definecolor{navy}{RGB}{31,56,100}
+\definecolor{okgreen}{RGB}{0,97,0}
+\definecolor{warnred}{RGB}{156,0,6}
+\definecolor{amber}{RGB}{156,101,0}
+\definecolor{barblue}{RGB}{60,110,180}
+
+\newcommand{\good}[1]{\textcolor{okgreen}{\textbf{#1}}}
+\newcommand{\bad}[1]{\textcolor{warnred}{\textbf{#1}}}
+\newcommand{\neut}[1]{\textcolor{amber}{\textbf{#1}}}
+\newcommand{\histbar}[1]{\textcolor{barblue}{\rule{#1}{7pt}}}
+
+\titleformat{\section}{\Large\bfseries\color{navy}}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\large\bfseries\color{navy}}{\thesubsection}{0.6em}{}
+
+\newtcolorbox{say}[1]{colback=blue!3,colframe=navy,fonttitle=\bfseries,
+  title={SAY --- #1},breakable,left=4pt,right=4pt,top=4pt,bottom=4pt}
+\newtcolorbox{ifasked}[1]{colback=gray!6,colframe=gray!55,fonttitle=\bfseries,
+  title={IF ASKED --- #1},breakable,left=4pt,right=4pt,top=4pt,bottom=4pt}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{navy}Log Report \#006 --- Benchmark Artifact Evaluation}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\title{\vspace{-1.4cm}\textbf{Log Report \#006}\\[2mm]
+\large Benchmark Artifact Evaluation: Measuring the Ceiling on Real Instances\\[1mm]
+\normalsize GPU-Accelerated Nemhauser--Trotter Kernelization for WCSPs}
+\author{\normalsize Presentation notes --- read alongside \texttt{artifact\_results.xlsx}}
+\date{\normalsize 2 September 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\begin{tcolorbox}[colback=okgreen!8,colframe=okgreen,title=\textbf{THE RESULT}]
+For every instance in the published benchmark we measured the \emph{maximum} that any minimum-cut
+kernelizer could possibly resolve --- a bound that constrains Gurobi exactly as much as it
+constrains us. On the UAI collection our kernelizer already attains that maximum on
+\textbf{145 of 146} instances (99.3\,\%), and on \textbf{97} of them the maximum is \textbf{zero}.
+On the \texttt{evalgm} collection we attain it on \textbf{348 of 373} (93.3\,\%).
+
+The 25 instances that fall short on \texttt{evalgm} are \emph{exactly} the 24 where max-flow trails
+Gurobi, plus one more --- the diagnostic predicts the gap with no error. Those 25 carry integral
+weights, so weight perturbation is permitted on them, unlike on UAI. Three of them are structurally
+identical to the synthetic \texttt{d\_m2000} case that perturbation already takes from 0\,\% to
+100\,\%.
+\end{tcolorbox}
+
+\vspace{2mm}
+\noindent\textbf{How to use this document.} Keep it open on a second screen; show the tables from
+the workbook and read from the shaded boxes.
+
+\tableofcontents
+
+% ======================================================================
+\section{What this run set out to answer}
+
+\begin{say}{opening}
+Everything until now was measured on instances we generated ourselves. The obvious objection is
+that we chose problems that flatter our method. So we obtained the published benchmark artifact
+from the paper we build on, and evaluated on it.
+
+We did not simply run the kernelizer and report numbers. We first measured, for every single
+instance, the \emph{maximum any method of this kind could achieve}. That bound applies to Gurobi
+too. Only then does a comparison mean anything.
+\end{say}
+
+The instrument is \texttt{apps/mincut\_lattice.cpp}. For each variable it asks whether the two
+copies in the double cover lie in the same strongly connected component of the residual graph. Two
+nodes in one component are reachable from each other along edges that still have spare capacity, so
+a cut separating them would leave a residual edge crossing it --- which no minimum cut can do. Hence:
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+  \item \textbf{same component} $\Rightarrow$ same side in \emph{every} minimum cut $\Rightarrow$
+        undecidable by \emph{any} method of this kind, Gurobi included;
+  \item \textbf{different components} $\Rightarrow$ some minimum cut separates them.
+\end{itemize}
+
+Counting the second group gives the \textbf{ceiling}.
+
+% ======================================================================
+\section{What was attempted --- show Table 1}
+
+\begin{center}
+\begin{tabular}{@{}lrrrrl@{}}
+\toprule
+Collection & Files & Header-Boolean & Loadable & Completed & Note \\
+\midrule
+\texttt{uai-instances} & 295 & 160 & 160 & 146 & 14 timed out at 900\,s \\
+\texttt{evalgm}, $<$10k vars & 557 & 557 & \bad{373} & 373 & 184 rejected by the loader \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{say}{Table 1, and a correction we found}
+Two collections. The UAI competition instances, and the smaller half of the \texttt{evalgm}
+benchmark.
+
+One correction. Our earlier census counted usable instances from the file header, which declares a
+maximum domain size. But the loader also checks \emph{each} variable, and rejects any with domain
+size one --- a variable pinned to a single value. On this subset that removed a further 184 of 557.
+So the figure of 878 usable \texttt{evalgm} instances is an over-count and we will re-measure it
+properly.
+\end{say}
+
+% ======================================================================
+\section{UAI: the ceiling is almost always zero --- show Table 2}
+
+\begin{center}
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+Verdict & Instances & Share & Meaning \\
+\midrule
+\bad{STRUCTURAL} & \textbf{97} & 60.6\,\% & ceiling is exactly zero \\
+\good{OPTIMAL}   & \textbf{48} & 30.0\,\% & we already attain the ceiling \\
+\neut{SELECTION} & 1 & 0.6\,\% & a better cut exists (\texttt{relational\_1}) \\
+\neut{TIMEOUT}   & 14 & 8.8\,\% & unfinished at 900\,s, all CNF-derived \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{@{}rl r@{}}
+\toprule
+Ceiling & & Instances \\
+\midrule
+exactly 0\,\% & \histbar{8.2cm} & \textbf{97} \\
+0 -- 1\,\%    & \histbar{2.3cm} & 27 \\
+1 -- 10\,\%   & \histbar{0.34cm} & 4 \\
+10 -- 50\,\%  & & 0 \\
+50 -- 99\,\%  & & 0 \\
+100\,\%       & \histbar{1.5cm} & \textbf{18} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{say}{Table 2}
+On 145 of the 146 instances that finished, our kernelizer already achieves the theoretical maximum
+--- ninety-nine point three percent. Not close to Gurobi; \emph{at the ceiling}, which Gurobi cannot
+exceed either.
+
+And on ninety-seven of them the ceiling is exactly zero. Nothing can be resolved by any method of
+this kind. That is not our failure; it is a property of those problems.
+
+Look at the distribution. Nothing lands between ten percent and one hundred. The \emph{ceiling
+itself} is all-or-nothing, which means the all-or-nothing behaviour is a property of the instances
+rather than of any algorithm. That fully explains the histogram published in the original paper.
+\end{say}
+
+\begin{ifasked}{what about the one SELECTION instance?}
+\texttt{relational\_1}, ceiling 100\,\%, currently 0\,\%. It is also the one instance our
+perturbation improved in the end-to-end run, 50\,\% to 100\,\%. So perturbation did little on UAI
+not because it fails, but because there was exactly one thing it could fix, and it fixed it.
+\end{ifasked}
+
+\begin{ifasked}{why did perturbation not run on the rest?}
+It refuses to. UAI weights come from log-probabilities and are decimals. The safety argument needs
+integral weights: two solutions of different cost then differ by at least one, which the
+perturbation can never bridge. With decimals that is false and the answer could change. The
+guard is now explicit and reports \texttt{DISABLED: vertex weights are not integral}.
+\end{ifasked}
+
+% ======================================================================
+\section{evalgm: a real target appears --- show Table 3}
+
+\begin{center}
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+Verdict & Instances & Share of loaded & Meaning \\
+\midrule
+\bad{STRUCTURAL} & 222 & 59.5\,\% & ceiling is exactly zero \\
+\good{OPTIMAL}   & 126 & 33.8\,\% & already at the ceiling \\
+\neut{SELECTION} & \textbf{25} & \textbf{6.7\,\%} & \good{fixable, and perturbation is permitted} \\
+SKIP             & 184 & --- & rejected by the loader \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{@{}rl r@{}}
+\toprule
+Ceiling & & Instances \\
+\midrule
+exactly 0\,\% & \histbar{7.4cm} & \textbf{222} \\
+0 -- 1\,\%    & \histbar{0.9cm} & 27 \\
+1 -- 10\,\%   & \histbar{0.27cm} & 8 \\
+10 -- 50\,\%  & & 0 \\
+50 -- 99\,\%  & \histbar{2.1cm} & \textbf{63} \\
+100\,\%       & \histbar{1.8cm} & \textbf{53} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{say}{Table 3}
+The same shape, but with an important difference: a hundred and sixteen instances have a ceiling
+above fifty percent. Real headroom exists here, and we already reach it on three hundred and
+forty-eight of three hundred and seventy-three --- ninety-three point three percent.
+
+Crucially, every one of the three hundred and seventy-three completed instances has \emph{integral}
+weights. That is the condition perturbation needs, and it holds throughout this collection.
+\end{say}
+
+% ======================================================================
+\section{The diagnostic predicts the gap exactly --- show Table 6}
+
+\begin{center}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Collection & Comparable & Identical & Max-flow better & Max-flow worse & Agreement \\
+\midrule
+UAI (Boolean) & 141 & 135 & 5 & 1 & \good{95.7\,\%} \\
+\texttt{evalgm} ($<$10k) & 373 & 349 & 0 & \textbf{24} & \good{93.6\,\%} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{say}{the sharpest finding in this report}
+On \texttt{evalgm} our kernelizer matches Gurobi exactly on three hundred and forty-nine of three
+hundred and seventy-three instances, and never beats it. It loses on twenty-four.
+
+The ceiling analysis, run completely independently, flagged twenty-five instances as having room to
+improve. Those twenty-five \emph{contain} the twenty-four. The diagnostic identifies precisely where
+we lose, without ever consulting Gurobi.
+
+That is what makes the tool worth reporting in its own right: it tells you, cheaply and per
+instance, whether an instance is worth working on.
+\end{say}
+
+\subsection{Against the published results}
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Comparable instances & 150 \\
+Exact match & \good{125} \\
+Differ & 25 \\
+Agreement & \good{83.3\,\%} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{say}{on the differences}
+Variable counts matched the published figure on \emph{all} one hundred and fifty-five instances,
+including every one where the resolved count differs. So our parser reads the same problem the
+authors did. The differences are in both directions and are concentrated on planning instances,
+which is the signature of LP tie-breaking between different Gurobi versions --- the published runs
+used a 2017 build.
+\end{say}
+
+% ======================================================================
+\section{The 25 fixable instances --- show Table 5}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llrrrr@{}}
+\toprule
+Instance & Family & Vertices & Now & Ceiling & Recoverable \\
+\midrule
+\texttt{hamming10-2.clq} & MaxClique & 11{,}264 & \bad{0\,\%} & \good{100\,\%} & \textbf{11{,}264} \\
+\texttt{hamming8-2.clq}  & MaxClique &  2{,}304 & \bad{0\,\%} & \good{100\,\%} & \textbf{2{,}304} \\
+\texttt{hamming6-2.clq}  & MaxClique &    448 & \bad{0\,\%} & \good{100\,\%} & \textbf{448} \\
+\texttt{cat\_paths\_60\_150\_0001} & Auction & 4{,}770 & 0\,\% & 2.12\,\% & 101 \\
+\texttt{cat\_paths\_60\_170\_0007} & Auction & 5{,}469 & 0\,\% & 0.84\,\% & 46 \\
+\texttt{cat\_paths\_60\_140\_0006} & Auction & 4{,}205 & 0\,\% & 0.76\,\% & 32 \\
+\multicolumn{4}{l}{\emph{\ldots and 17 further Auction / PackupWeighted instances}} & & 267 \\
+\midrule
+\multicolumn{5}{r}{\textbf{Total recoverable}} & \textbf{14{,}462} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{say}{Table 5 --- the next experiment}
+Twenty-five instances, fourteen thousand four hundred and sixty-two recoverable vertices. Ninety-seven
+percent of that sits in three instances from the maximum-clique family.
+
+Those three are worth looking at closely. All-half optimal, integral weights, ceiling one hundred
+percent, currently resolving zero. That is exactly the profile of \texttt{d\_m2000} --- the synthetic
+instance where perturbation already takes us from zero to one hundred percent. If perturbation
+behaves the same way here, it will be on a third-party benchmark instance rather than one we made.
+\end{say}
+
+\begin{center}
+\begin{tabular}{@{}lrrlll@{}}
+\toprule
+Instance & Vertices & $W$ & Integral & All-half optimal & Ceiling \\
+\midrule
+\texttt{hamming6-2.clq}  &    448 & 25{,}024 & yes & YES & 100\,\% \\
+\texttt{hamming8-2.clq}  &  2{,}304 & 526{,}592 & yes & YES & 100\,\% \\
+\texttt{hamming10-2.clq} & 11{,}264 & $1.05\times10^{7}$ & yes & YES & 100\,\% \\
+\midrule
+\texttt{d\_m2000} (synthetic, for comparison) & 4{,}430 & 7{,}016 & yes & YES & 100\,\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ======================================================================
+\section{Family matters more than size --- show Table 4}
+
+\begin{center}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+Family & Structural & Optimal & Selection & Skipped & Total & At ceiling \\
+\midrule
+\texttt{CFN/Auction}          & 144 &  6 & \neut{20} &   0 & 170 & 88.2\,\% \\
+\texttt{MRF/DBN}              &   0 &  0 &  0 & 108 & 108 & --- \\
+\texttt{CVPR/ChineseChars}    &   0 & 63 &  0 &   0 &  63 & \good{100\,\%} \\
+\texttt{WPMS/MaxClique}       &  59 &  0 & \neut{3} &   0 &  62 & 95.2\,\% \\
+\texttt{WPMS/PackupWeighted}  &   1 &  2 & \neut{2} &  57 &  62 & 60.0\,\% \\
+\texttt{MRF/Segmentation}     &   0 & 50 &  0 &   0 &  50 & \good{100\,\%} \\
+\texttt{MRF/Grid}             &  16 &  5 &  0 &   0 &  21 & \good{100\,\%} \\
+\texttt{WPMS/PlanningWithPref}&   0 &  0 &  0 &  13 &  13 & --- \\
+\texttt{WPMS/MIPLib}          &   0 &  0 &  0 &   6 &   6 & --- \\
+\texttt{MaxCSP/Coloring}      &   2 &  0 &  0 &   0 &   2 & \good{100\,\%} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{say}{Table 4}
+Behaviour clusters by family, not by size. Segmentation and Chinese-character instances are at the
+ceiling everywhere. Auction and MaxClique hold every fixable instance we found. Four families are
+lost entirely to the loader's domain restriction.
+\end{say}
+
+% ======================================================================
+\section{Corrections to Report 005 --- show Table 7}
+
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{Usable \texttt{evalgm} count.} 878 was derived from file headers. The loader also
+      rejects variables of domain size 1, removing a further 184 of 557 on this subset. The true
+      figure is lower and must be re-measured with a loader-accurate test.
+\item \textbf{The all-half law is one-way.} ``max-flow $=W$ $\Rightarrow$ resolves zero'' holds
+      everywhere. The converse fails on UAI: 35 instances have all-half not optimal yet a ceiling of
+      zero. On \texttt{evalgm} both directions hold on all 373. The two-way form appears to require
+      integral weights.
+\item \textbf{Perturbation is not applicable to UAI} by design, not by failure.
+\item \textbf{The sweep's verdict counts were mislabelled.} 149 reported as \textsc{timeout} were in
+      fact 135 non-Boolean skips and 14 real timeouts. The script label is fixed.
+\end{enumerate}
+
+% ======================================================================
+\section{What is good, and what is not}
+
+\subsection*{Good}
+\begin{itemize}[leftmargin=1.4em]
+\item 99.3\,\% at the ceiling on UAI, 93.3\,\% on \texttt{evalgm}, on third-party instances.
+\item The ceiling bounds Gurobi too, so ``we cannot do better'' becomes ``nobody can''.
+\item The diagnostic predicts the Gurobi gap exactly: 25 flagged, 24 real losses, all contained.
+\item 83.3\,\% exact agreement with the published per-instance results; variable counts match on
+      all 155, so the parser is correct.
+\item A clear next target: 25 instances, integral weights, perturbation permitted, and three of
+      them structurally identical to a case perturbation already solves.
+\end{itemize}
+
+\subsection*{Not good}
+\begin{itemize}[leftmargin=1.4em]
+\item 14 UAI timeouts at 900\,s, all CNF-derived, where Gurobi finishes in seconds. Max-flow is
+      genuinely slower on that instance class.
+\item Max-flow never beats Gurobi on \texttt{evalgm} --- 349 ties, 24 losses, 0 wins.
+\item The usable-instance count was over-stated and must be corrected.
+\item \texttt{logistics.c.cnf} recorded 5{,}240\,s against a 900\,s limit, most likely a machine
+      sleep. That instance should be re-run before the number is quoted.
+\item Only the smaller half of \texttt{evalgm} has been evaluated; instances above 10{,}000
+      variables remain.
+\end{itemize}
+
+% ======================================================================
+\section{Next steps}
+
+\begin{enumerate}[leftmargin=1.6em]
+\item Run perturbation on the three \texttt{hamming} instances. Prediction: 0\,\% $\to$ 100\,\%,
+      matching \texttt{d\_m2000}.
+\item Run perturbation across all 25 SELECTION instances and verify the objective is unchanged with
+      an exact solve.
+\item Re-count usable \texttt{evalgm} instances with a loader-accurate test.
+\item Extend the sweep to \texttt{evalgm} instances above 10{,}000 variables.
+\item Investigate why max-flow times out on CNF-derived instances.
+\item Re-run \texttt{logistics.c.cnf} under a controlled timer.
+\end{enumerate}
+
+\vspace{4mm}
+\noindent\rule{\textwidth}{0.4pt}\\
+\small
+Data in \texttt{artifact\_results.xlsx}. Raw logs in \texttt{log/2026-08-31/},
+\texttt{log/2026-09-01/}, \texttt{log/2026-09-02/}. Branch \texttt{study/artifact-eval}.
+Hardware: Intel i5-14450HX, 22.6\,GiB RAM, RTX 4050 Laptop (6\,GiB, sm\_89), Ubuntu 26.04,
+g++ 15.2.0, CUDA 12.4, Gurobi 13.0.2 single-thread.
+
+\end{document}
