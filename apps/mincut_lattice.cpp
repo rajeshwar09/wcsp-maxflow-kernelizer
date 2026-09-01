@@ -8,7 +8,7 @@
 // A cut placing them on opposite sides would leave a residual edge crossing it, which no minimum cut can do
 // That gives a test:
 //
-//   for a CCG vertex v with copies v_L and v_R in the double cover
+//   for a CCG vertex v with copies v_L and v_R in the double cover,
 //     SCC(v_L) == SCC(v_R)  ->  they are on the same side in EVERY min-cut, so v is undecidable by any min-cut method
 //     SCC(v_L) != SCC(v_R)  ->  SOME min-cut separates them, so v is decidable in principle
 //
@@ -18,17 +18,18 @@
 // Build:
 //   g++ -std=c++17 -O2 -I. apps/mincut_lattice.cpp -o mincut_lattice -lopenblas
 // Usage:
-//   ./mincut_lattice <file.wcsp>
+//   ./mincut_lattice [--format d|u|auto] <file.wcsp|file.uai>
 
 #include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <queue>
 #include <stack>
-#include <vector>
-#include <memory>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "third_party/wcsp-solver/src/WCSPInstance.h"
 #include "third_party/wcsp-solver/src/ConstraintCompositeGraph.h"
@@ -120,19 +121,16 @@ int main(int argc, char** argv) {
       std::string p(path);
       f = (p.size() >= 4 && p.compare(p.size() - 4, 4, ".uai") == 0) ? "u" : "d";
     }
-    if (f == "u" || f == "uai")
-      fformat = WCSPInstance<>::Format::UAI;
-    else if (f == "d" || f == "dimacs" || f == "wcsp") 
-      fformat = WCSPInstance<>::Format::DIMACS;
-    else { 
-      std::cerr << "bad --format: " << fmt << "\n"; return 1;
-    }
+    if (f == "u" || f == "uai")                        fformat = WCSPInstance<>::Format::UAI;
+    else if (f == "d" || f == "dimacs" || f == "wcsp") fformat = WCSPInstance<>::Format::DIMACS;
+    else { std::cerr << "bad --format: " << fmt << " (expected d, u or auto)\n"; return 1; }
   }
 
   std::ifstream in(path);
   if (!in) { std::cerr << "cannot open " << path << "\n"; return 2; }
 
-  //  Non-Boolean domains cannot be expressed as a CCG. Skip rather than terminate.
+  //  Non-Boolean domains cannot be expressed as a CCG. Skip rather than terminate,
+  //  so a batch run over the artifact survives them.
   std::unique_ptr<WCSPInstance<>> instp;
   try {
     instp.reset(new WCSPInstance<>(in, fformat));
@@ -141,6 +139,7 @@ int main(int argc, char** argv) {
     return 5;
   }
   WCSPInstance<>& inst = *instp;
+
   ConstraintCompositeGraph<> ccg;
   WCSPInstance<>::constraint_t::Polynomial p;
   for (const auto& c : inst.getConstraints()) c.toPolynomial(p);
@@ -167,10 +166,12 @@ int main(int argc, char** argv) {
 
   cap_t total_weight = 0;
   cap_t inf_cap = cap_t(1);
+  bool w_integral = true;
   for (int i = 0; i < n; i++) {
     cap_t w = static_cast<cap_t>(vertex_weight_map[ccg_vertices[i]]);
     total_weight += w;
     inf_cap += w;
+    if (!is_integral(w)) w_integral = false;
   }
 
   std::vector<edge<cap_t>> fe;
@@ -196,10 +197,12 @@ int main(int argc, char** argv) {
 
   std::cout << "=== INSTANCE ===\n";
   std::cout << "  file                 : " << path << "\n";
+  std::cout << "  format               : " << (fformat == WCSPInstance<>::Format::UAI ? "uai" : "dimacs") << "\n";
   std::cout << "  CCG vertices n       : " << n << "\n";
   std::cout << "  double cover nodes   : " << flow_n << "\n";
   std::cout << "  double cover edges   : " << net.num_edges << "\n";
   std::cout << "  total vertex weight W: " << total_weight << "\n";
+  std::cout << "  weights integral?    : " << (w_integral ? "yes" : "no") << "\n";
   std::cout << "  max-flow             : " << F << "\n";
   std::cout << "  LP optimum (= F/2)   : " << (F / 2) << "\n\n";
 
@@ -213,7 +216,8 @@ int main(int argc, char** argv) {
       : "the all-half solution is NOT optimal; a min-cut must decide something")
       << "\n\n";
 
-  //  Picard-Queyranne: min-cuts correspond to closed sets of the SCC DAG of the residual graph. Two nodes in the same SCC are on the same side in EVERY min-cut
+  //  Nodes sharing a strongly connected component of the residual graph fall on the same side of EVERY minimum cut, so counting the pairs that do NOT share one
+  //  gives the exact ceiling for any min-cut based method
   std::vector<int> comp;
   int ncomp = 0;
   strongly_connected(net, comp, ncomp);
@@ -223,7 +227,7 @@ int main(int argc, char** argv) {
     if (comp[i + 1] == comp[n + i + 1]) same++; else diff++;
   }
 
-  std::cout << "=== MIN-CUT LATTICE (Picard-Queyranne) ===\n";
+  std::cout << "=== MIN-CUT CEILING ANALYSIS ===\n";
   std::cout << "  SCCs in residual graph      : " << ncomp << "\n";
   std::cout << "  pairs v_L,v_R in SAME SCC   : " << same
             << "  (" << (100.0 * same / n) << "%)  <- undecidable by ANY min-cut\n";

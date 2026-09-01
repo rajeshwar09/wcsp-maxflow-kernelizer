@@ -14,6 +14,7 @@
 //      0.5 (undecided)   - both copies on the same side
 //  It is Nemhauser-Trotter classification
 
+#include <cmath>
 #include <map>
 #include <vector>
 #include <limits>
@@ -41,7 +42,6 @@ namespace maxflow {
   template <class CCG = ConstraintCompositeGraph<>>
   class KernelizerMaxflow : public Kernelizer<CCG> {
     public:
-
       //  Default construction leaves perturbation off, so every existing call site keeps its current behaviour
       KernelizerMaxflow() : pcfg_() {}
       explicit KernelizerMaxflow(const perturb_config& cfg) : pcfg_(cfg) {}
@@ -127,14 +127,18 @@ namespace maxflow {
         vertex_id_t flow_source = 0;        //  source ID
         vertex_id_t flow_sink = 2 * n + 1;  //  sink ID
 
-        //  Tie-breaking
-        //  weights[i] is the capacity actually used for CCG vertex i with perturbation off it equals the original weight exactly.
+        //  Tie-breaking perturbation. weights[i] is the capacity actually used for CCG vertex i; with perturbation off, or when a guard trips, it equals the original weight exactly
+        //
+        //  w_integral decides guard 2: the correctness bound only holds when the weights are whole numbers, which is true of DIMACS instances but NOT of UAI instances, whose weights come from log-probabilities.
         cap_t total_w = cap_t(0);
+        bool  w_integral = true;
         for (int i = 0; i < n; i++) {
-          total_w += static_cast<cap_t>(vertex_weight_map[ccg_vertices[i]]);
+          cap_t w = static_cast<cap_t>(vertex_weight_map[ccg_vertices[i]]);
+          total_w += w;
+          if (!is_integral(w)) w_integral = false;
         }
 
-        perturber pert(pcfg_, n, total_w);
+        perturber pert(pcfg_, n, total_w, w_integral);
 
         //  Compute INF = 1 + sum of all (perturbed) weights
         std::vector<cap_t> weights(n);
@@ -273,7 +277,6 @@ namespace maxflow {
         }
       }
 
-    
     private:
       perturb_config pcfg_;
   };
