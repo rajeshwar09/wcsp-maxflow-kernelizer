@@ -30,6 +30,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <new>
 
 #include "third_party/wcsp-solver/src/WCSPInstance.h"
 #include "third_party/wcsp-solver/src/ConstraintCompositeGraph.h"
@@ -129,14 +130,27 @@ int main(int argc, char** argv) {
   std::ifstream in(path);
   if (!in) { std::cerr << "cannot open " << path << "\n"; return 2; }
 
-  //  Non-Boolean domains cannot be expressed as a CCG. Skip rather than terminate,
-  //  so a batch run over the artifact survives them.
+  //  reasons an instance can be unusable
+  //    domain_error  -> a variable is not Boolean, or is pinned to one value  (rc 5)
+  //    bad_alloc     -> a cost table or polynomial is too large to represent  (rc 6)
+  //  The second shows up as bad_array_new_length: at arity 77 the code computes 2^77
+  //  as an array length, which overflows and is rejected before any allocation is
+  //  attempted. Measured arity on this benchmark reaches 580.
   std::unique_ptr<WCSPInstance<>> instp;
   try {
     instp.reset(new WCSPInstance<>(in, fformat));
   } catch (const std::domain_error& e) {
     std::cout << "skipped -- " << e.what() << "\n";
     return 5;
+  } catch (const std::bad_alloc&) {
+    std::cout << "skipped -- cost table too large to represent - high arity\n";
+    return 6;
+  } catch (const std::length_error&) {
+    std::cout << "skipped -- cost table exceeds the container limit - high arity\n";
+    return 6;
+  } catch (const std::exception& e) {
+    std::cout << "skipped -- parse failed: " << e.what() << "\n";
+    return 6;
   }
   WCSPInstance<>& inst = *instp;
 

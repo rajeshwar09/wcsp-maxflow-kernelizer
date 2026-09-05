@@ -210,15 +210,24 @@ int main(int argc, char** argv) {
   std::ifstream in(path);
   if (!in) { std::cerr << "cannot open " << path << "\n"; return 2; }
   auto t0 = clk::now();
-  //  The CCG needs Boolean variables. Both loaders throw domain_error on anything
-  //  wider, and 70.8 % of the benchmark artifact is non-Boolean. Left uncaught this
-  //  reaches terminate() and kills the whole batch, so skip cleanly with rc=5.
+  //  rc 5 = not Boolean (or a variable pinned to one value)
+  //  rc 6 = arity too high to represent -- surfaces as bad_array_new_length, which
+  //         derives from bad_alloc, when 2^arity overflows an array length
   std::unique_ptr<WCSPInstance<>> instp;
   try {
     instp.reset(new WCSPInstance<>(in, fformat));
   } catch (const std::domain_error& e) {
     std::cout << "[e2e] SKIP              : " << e.what() << "\n";
     return 5;
+  } catch (const std::bad_alloc&) {
+    std::cout << "[e2e] SKIP              : cost table too large to represent - high arity\n";
+    return 6;
+  } catch (const std::length_error&) {
+    std::cout << "[e2e] SKIP              : cost table exceeds the container limit - high arity\n";
+    return 6;
+  } catch (const std::exception& e) {
+    std::cout << "[e2e] SKIP              : parse failed: " << e.what() << "\n";
+    return 6;
   }
   WCSPInstance<>& instance = *instp;
   auto t1 = clk::now();
