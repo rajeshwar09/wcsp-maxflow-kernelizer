@@ -44,6 +44,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <new>
 
 #include "third_party/wcsp-solver/src/global.h"
 #include "third_party/wcsp-solver/src/RunningTime.h"
@@ -224,15 +225,26 @@ int main(int argc, char** argv) {
   std::cout << "[stage] parse           : " << secs(t0, t1) << " s\n";
 
   // ---- build the constraint composite graph ------------------------------
+  //  toPolynomial expands an arity-k constraint into up to 2^k terms. When arity reaches 580, allocation fails. It will catch it rather than aborting
   ccg_t ccg;
-  WCSPInstance<>::constraint_t::Polynomial p;
-  for (const auto& c : instance.getConstraints()) c.toPolynomial(p);
-  auto t2 = clk::now();
-  std::cout << "[stage] toPolynomial    : " << secs(t1, t2) << " s\n";
+  ccg_t::weight_t s = 0;
+  clk::time_point t2, t3;
+  try {
+    WCSPInstance<>::constraint_t::Polynomial p;
+    for (const auto& c : instance.getConstraints()) c.toPolynomial(p);
+    t2 = clk::now();
+    std::cout << "[stage] toPolynomial    : " << secs(t1, t2) << " s\n";
 
-  ccg_t::weight_t s = ccg.addPolynomial(p);
-  auto t3 = clk::now();
-  std::cout << "[stage] addPolynomial   : " << secs(t2, t3) << " s\n";
+    s = ccg.addPolynomial(p);
+    t3 = clk::now();
+    std::cout << "[stage] addPolynomial   : " << secs(t2, t3) << " s\n";
+  } catch (const std::bad_alloc&) {
+    std::cout << "[e2e] SKIP              : out of memory building the CCG (constraint arity too high)\n";
+    return 6;
+  } catch (const std::exception& e) {
+    std::cout << "[e2e] SKIP              : CCG construction failed: " << e.what() << "\n";
+    return 6;
+  }
 
   //  simplify() resolves trivially-forced variables before any kernelizer runs, so it is common to every configuration and not attributed to the kernelizer
   std::map<vid_t, bool> assignments;

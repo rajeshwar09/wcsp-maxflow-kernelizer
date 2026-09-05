@@ -140,10 +140,21 @@ int main(int argc, char** argv) {
   }
   WCSPInstance<>& inst = *instp;
 
+  //  toPolynomial expands an arity-k constraint into up to 2^k terms. 
+  //  immediate exhaustion. Normal to the CCG construction, not a defect and is repair
+  //  but it must not abort the process and take a whole batch run with it
   ConstraintCompositeGraph<> ccg;
-  WCSPInstance<>::constraint_t::Polynomial p;
-  for (const auto& c : inst.getConstraints()) c.toPolynomial(p);
-  ccg.addPolynomial(p);
+  try {
+    WCSPInstance<>::constraint_t::Polynomial p;
+    for (const auto& c : inst.getConstraints()) c.toPolynomial(p);
+    ccg.addPolynomial(p);
+  } catch (const std::bad_alloc&) {
+    std::cout << "skipped -- out of memory building the CCG (constraint arity too high)\n";
+    return 6;
+  } catch (const std::exception& e) {
+    std::cout << "skipped -- CCG construction failed: " << e.what() << "\n";
+    return 6;
+  }
   std::map<vid_t, bool> pre;
   ccg.simplify(pre);
   graph_t g = *ccg.getGraph();
