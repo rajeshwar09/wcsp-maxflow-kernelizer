@@ -125,9 +125,11 @@ printf '%s\n' "$LIST" | while IFS= read -r f; do
   e=$(( $(date +%s) - s ))
 
   #  Distinguish the four non-result outcomes properly.
-  if [ "$rc" = "5" ] || printf '%s' "$o" | grep -q 'skipped --'; then v=SKIP
+  if [ "$rc" = "6" ]; then v=SKIP_ARITY
+  elif [ "$rc" = "5" ]; then v=SKIP_DOMAIN
   elif printf '%s' "$o" | grep -q 'empty CCG'; then v=EMPTY
   elif [ "$rc" = "124" ]; then v=TIMEOUT
+  elif printf '%s' "$o" | grep -q 'skipped --'; then v=SKIP_DOMAIN
   else
     v=$(printf '%s' "$o" | sed -n 's/.*VERDICT: \([A-Z]*\).*/\1/p' | head -1)
     [ -z "$v" ] && v="FAIL_rc$rc"

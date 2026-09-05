@@ -197,7 +197,9 @@ for k in $KERNS; do
 
     case $rc in
       0)   status=ok ;;
-      5)   status=skip_nonboolean ;;
+      4)   status=solver_timeout ;;
+      5)   status=skip_domain ;;
+      6)   status=skip_arity ;;
       124) status=timeout ;;
       *)   status="fail_rc$rc" ;;
     esac
