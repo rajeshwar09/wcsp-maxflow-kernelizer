@@ -22,6 +22,7 @@ e2e_solve
 e2e_solve_gpu
 mincut_lattice
 /e2e_solve_np
+/wcsp_collapse
 
 # Editor/OS files
 .DS_Store
