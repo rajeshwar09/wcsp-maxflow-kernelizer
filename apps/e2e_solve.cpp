@@ -16,21 +16,20 @@
 //        third_party/wcsp-solver/src/LinearProgramSolverGurobi.cpp \
 //        -o e2e_solve -L$GUROBI_HOME/lib -lgurobi_c++ -lgurobi130 -lopenblas
 //
-// Build (adds the GPU kernelizer):
-//   nvcc -x cu -std=c++17 -O2 -arch=sm_89 -DUSE_GPU -DHAVE_GUROBI -I. \
-//        -I$GUROBI_HOME/include apps/e2e_solve.cpp ... (same sources/libs)
-//
 // Usage:
 //   ./e2e_solve [options] <file.wcsp|file.uai>
 //     --kernelizer none|cpu|gpu|lp     which kernelizer to run   (default cpu)
 //     --solver     ilp|mp|none         how to solve the remnant  (default ilp)
 //     --format     d|u|auto            input format              (default auto)
 //     --max-rounds N                   cap kernelization rounds  (default 100)
+//     --max-arity  N                   refuse above this arity   (default 15)
 //     --time-limit SEC                 solver time limit         (default none)
 //     --perturb off|int|real           weight tie-breaking       (default off)
 //     --spread K                       int mode: offsets 1..K    (default 8)
 //     --delta D                        real mode: 0 = auto 1/2n  (default auto)
 //     --seed S                         perturbation seed         (default 1)
+//
+// Exit codes: 0 ok | 2 cannot open | 3 built without required backend | 4 solver timeout | 5 not Boolean | 6 arity too high | 7 unexpected failure
 
 #include <chrono>
 #include <cstdint>
@@ -79,6 +78,23 @@ static double secs(clk::time_point a, clk::time_point b) {
   return std::chrono::duration<double>(b - a).count();
 }
 
+template <class Inst>
+static size_t max_constraint_arity(const Inst& inst) {
+  size_t m = 0;
+  for (const auto& c : inst.getConstraints()) {
+    size_t a = c.getVariables().size();
+    if (a > m) m = a;
+  }
+  return m;
+}
+
+//  Bytes toPolynomial will request for a given arity, saturating rather than overflowing so the comparison stays meaningful at large arity
+static double polynomial_bytes(size_t arity) {
+  if (arity >= 32) return 1e300;
+  double side = static_cast<double>(1ULL << arity);
+  return side * side * 8.0;
+}
+
 static void usage(const char* prog) {
   std::cerr
     << "Usage: " << prog << " [options] <file.wcsp|file.uai>\n"
@@ -86,6 +102,7 @@ static void usage(const char* prog) {
     << "  --solver     ilp|mp|none       remnant solver           (default: ilp)\n"
     << "  --format     d|u|auto          input format             (default: auto)\n"
     << "  --max-rounds N                 max kernelization rounds (default: 100)\n"
+    << "  --max-arity  N                 refuse above this arity  (default: 15)\n"
     << "  --time-limit SEC               solver time limit        (default: none)\n"
     << "  --perturb off|int|real         weight tie-breaking      (default: off)\n"
     << "  --spread K                     int mode: offsets 1..K   (default: 8)\n"
@@ -104,14 +121,15 @@ static void usage(const char* prog) {
     << "  only inside the flow network the kernelizer builds; the CCG keeps its original\n"
     << "  weights, so the reported objective is always that of the real problem.\n"
     << "  A fresh perturbation is drawn each round -- that is what makes iterating useful.\n"
-    << "  It does not run on non-integral weights (UAI).\n";
+    << "  It refuses to run on non-integral weights (UAI), where its bound does not hold.\n";
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
   std::string kern = "cpu";
   std::string solver = "ilp";
   std::string format = "auto";
   long max_rounds = 100;
+  long max_arity = 15;
   double time_limit = -1.0;
   const char* path = nullptr;
 
@@ -125,6 +143,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--solver") && i + 1 < argc)     solver = argv[++i];
     else if (!std::strcmp(argv[i], "--format") && i + 1 < argc)     format = argv[++i];
     else if (!std::strcmp(argv[i], "--max-rounds") && i + 1 < argc) max_rounds = std::atol(argv[++i]);
+    else if (!std::strcmp(argv[i], "--max-arity") && i + 1 < argc)  max_arity = std::atol(argv[++i]);
     else if (!std::strcmp(argv[i], "--time-limit") && i + 1 < argc) time_limit = std::atof(argv[++i]);
     else if (!std::strcmp(argv[i], "--perturb") && i + 1 < argc)    perturb = argv[++i];
     else if (!std::strcmp(argv[i], "--spread") && i + 1 < argc)     pspread = std::atol(argv[++i]);
@@ -150,7 +169,7 @@ int main(int argc, char** argv) {
   if (solver == "ilp")  { std::cerr << "this binary was built without -DHAVE_GUROBI\n"; return 3; }
 #endif
 
-  //  Input format. `auto` decides from the extension: .uai -> UAI, else DIMACS. The benchmark artifact mixes both, so batch runs depend on this
+  //  Input format. `auto` decides from the extension: .uai -> UAI, else DIMACS.
   WCSPInstance<>::Format fformat = WCSPInstance<>::Format::DIMACS;
   {
     std::string f = format;
@@ -163,8 +182,8 @@ int main(int argc, char** argv) {
     else { std::cerr << "bad --format: " << format << " (expected d, u or auto)\n"; return 1; }
   }
 
-  //  Perturbation settings. The base seed is advanced by the round number inside the loop, so each round draws a different perturbation and therefore lands on a
-  //  different vertex of the LP polytope. With a fixed seed the whole run is reproducible
+  //  Perturbation settings. The base seed is updated by the round number inside the loop, so each round draws a different perturbation and therefore lands on a
+  //  different vertex of the LP polytope. With fixed seed the whole run is reproducible
   maxflow::perturb_config pcfg_base;
   if (!maxflow::parse_perturb_mode(perturb, pcfg_base.mode)) {
     std::cerr << "bad --perturb: " << perturb << " (expected off, int or real)\n"; return 1;
@@ -196,6 +215,7 @@ int main(int argc, char** argv) {
   std::cout << "[e2e] kernelizer        : " << kern << "\n";
   std::cout << "[e2e] solver            : " << solver << "\n";
   std::cout << "[e2e] max rounds        : " << max_rounds << "\n";
+  std::cout << "[e2e] max arity         : " << max_arity << "\n";
   std::cout << "[e2e] perturb           : " << maxflow::perturb_mode_name(pcfg_base.mode);
   if (pcfg_base.mode == maxflow::perturb_mode::integer)
     std::cout << "  spread=" << pspread << "  seed=" << pseed;
@@ -210,50 +230,46 @@ int main(int argc, char** argv) {
   std::ifstream in(path);
   if (!in) { std::cerr << "cannot open " << path << "\n"; return 2; }
   auto t0 = clk::now();
-  //  rc 5 = not Boolean (or a variable pinned to one value)
-  //  rc 6 = arity too high to represent -- surfaces as bad_array_new_length, which
-  //         derives from bad_alloc, when 2^arity overflows an array length
+  //  The CCG needs Boolean variables. Skip others properly with rc 5
   std::unique_ptr<WCSPInstance<>> instp;
   try {
     instp.reset(new WCSPInstance<>(in, fformat));
   } catch (const std::domain_error& e) {
     std::cout << "[e2e] SKIP              : " << e.what() << "\n";
     return 5;
-  } catch (const std::bad_alloc&) {
-    std::cout << "[e2e] SKIP              : cost table too large to represent - high arity\n";
-    return 6;
-  } catch (const std::length_error&) {
-    std::cout << "[e2e] SKIP              : cost table exceeds the container limit - high arity\n";
-    return 6;
-  } catch (const std::exception& e) {
-    std::cout << "[e2e] SKIP              : parse failed: " << e.what() << "\n";
-    return 6;
   }
   WCSPInstance<>& instance = *instp;
   auto t1 = clk::now();
   std::cout << "[stage] parse           : " << secs(t0, t1) << " s\n";
 
-  // ---- build the constraint composite graph ------------------------------
-  //  toPolynomial expands an arity-k constraint into up to 2^k terms. When arity reaches 580, allocation fails. It will catch it rather than aborting
-  ccg_t ccg;
-  ccg_t::weight_t s = 0;
-  clk::time_point t2, t3;
-  try {
-    WCSPInstance<>::constraint_t::Polynomial p;
-    for (const auto& c : instance.getConstraints()) c.toPolynomial(p);
-    t2 = clk::now();
-    std::cout << "[stage] toPolynomial    : " << secs(t1, t2) << " s\n";
+  // ---- arity guard -------------------------------------------------------
+  //  This check come before toPolynomial
+  {
+    size_t arity = max_constraint_arity(instance);
+    double need = polynomial_bytes(arity);
+    std::cout << "[graph] max arity       : " << arity;
+    if (need < 1e300) std::cout << "   (CCG needs " << (need / 1073741824.0) << " GiB)";
+    else              std::cout << "   (CCG allocation overflows)";
+    std::cout << "\n";
 
-    s = ccg.addPolynomial(p);
-    t3 = clk::now();
-    std::cout << "[stage] addPolynomial   : " << secs(t2, t3) << " s\n";
-  } catch (const std::bad_alloc&) {
-    std::cout << "[e2e] SKIP              : out of memory building the CCG (constraint arity too high)\n";
-    return 6;
-  } catch (const std::exception& e) {
-    std::cout << "[e2e] SKIP              : CCG construction failed: " << e.what() << "\n";
-    return 6;
+    if (static_cast<long>(arity) > max_arity) {
+      std::cout << "[e2e] SKIP              : constraint arity " << arity
+                << " exceeds --max-arity " << max_arity
+                << "; the CCG construction would allocate 2^(2*arity) doubles\n";
+      return 6;
+    }
   }
+
+  // ---- build the constraint composite graph ------------------------------
+  ccg_t ccg;
+  WCSPInstance<>::constraint_t::Polynomial p;
+  for (const auto& c : instance.getConstraints()) c.toPolynomial(p);
+  auto t2 = clk::now();
+  std::cout << "[stage] toPolynomial    : " << secs(t1, t2) << " s\n";
+
+  ccg_t::weight_t s = ccg.addPolynomial(p);
+  auto t3 = clk::now();
+  std::cout << "[stage] addPolynomial   : " << secs(t2, t3) << " s\n";
 
   //  simplify() resolves trivially-forced variables before any kernelizer runs, so it is common to every configuration and not attributed to the kernelizer
   std::map<vid_t, bool> assignments;
@@ -288,8 +304,7 @@ int main(int argc, char** argv) {
       prev = assignments.size();
       auto k0 = clk::now();
 
-      //  A fresh perturbation each round. This is the point of iterating: with unchanged weights round 2 sees an identical graph and the fixed point is immediate, which
-      //  is exactly what happens on the d_m* family with --perturb off
+      //  A fresh perturbation each round
       maxflow::perturb_config pc = pcfg_base;
       pc.seed    = pcfg_base.seed + static_cast<std::uint64_t>(i);
       pc.verbose = (i == 1);
@@ -357,7 +372,7 @@ int main(int argc, char** argv) {
     } else {
       auto s0 = clk::now();
       //  WCSPLift's solvers THROW on timeout rather than returning. Left uncaught this reaches terminate() and the process dies with a core dump and no objective
-      //  line at all, which is indistinguishable from a crash. Catch it and report.
+      //  line at all, which is difficult to separately find from a crash
       try {
         if (solver == "mp") {
           MWVCSolverMessagePassing<> ms(1e-6);
@@ -382,7 +397,6 @@ int main(int argc, char** argv) {
         std::cout << "[solve] ERROR           : " << e.what() << "\n";
       }
       catch (...) {
-        //  MWVCSolverMessagePassing also has a timeout exception type that does not derive from std::exception in every build. Never let it reach terminate().
         timed_out = true;
         std::cout << "[solve] TIMEOUT         : solver aborted (unrecognised exception)\n";
       }
@@ -410,4 +424,25 @@ int main(int argc, char** argv) {
   std::cout << "[e2e] solve time        : " << solve_time << " s\n";
   std::cout << "[e2e] TOTAL TIME        : " << secs(t_all0, t_all1) << " s\n";
   return timed_out ? 4 : 0;
+}
+
+//  Backstop. The arity guard above prevents the known fatal case, but an unexpected
+//  exception anywhere else should still produce a readable line and an exit code
+//  rather than a core dump that kills a batch run.
+int main(int argc, char** argv) {
+  try {
+    return run(argc, argv);
+  } catch (const std::bad_alloc&) {
+    std::cout << "[e2e] SKIP              : out of memory\n";
+    return 6;
+  } catch (const std::domain_error& e) {
+    std::cout << "[e2e] SKIP              : " << e.what() << "\n";
+    return 5;
+  } catch (const std::exception& e) {
+    std::cout << "[e2e] FAILED            : " << e.what() << "\n";
+    return 7;
+  } catch (...) {
+    std::cout << "[e2e] FAILED            : unknown exception\n";
+    return 7;
+  }
 }

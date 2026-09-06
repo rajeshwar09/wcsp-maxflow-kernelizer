@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 #include <new>
+#include <cstdlib>
 
 #include "third_party/wcsp-solver/src/WCSPInstance.h"
 #include "third_party/wcsp-solver/src/ConstraintCompositeGraph.h"
@@ -40,6 +41,17 @@ using namespace maxflow;
 typedef ConstraintCompositeGraph<>::variable_id_t vid_t;
 typedef ConstraintCompositeGraph<>::graph_t graph_t;
 typedef boost::graph_traits<graph_t>::vertex_descriptor vertex_t;
+
+//  Largest constraint scope
+template <class Inst>
+static size_t max_constraint_arity(const Inst& inst) {
+  size_t m = 0;
+  for (const auto& c : inst.getConstraints()) {
+    size_t a = c.getVariables().size();
+    if (a > m) m = a;
+  }
+  return m;
+}
 
 //  Iterative Tarjan. The double cover reaches tens of millions of nodes, so a recursive implementation would overflow the stack
 static void strongly_connected(const flow_network<cap_t>& net, std::vector<int>& comp, int& ncomp) {
@@ -108,9 +120,12 @@ int main(int argc, char** argv) {
 
   //  Format is chosen by extension unless --format overrides it.
   std::string fmt = "auto";
+  size_t max_arity = 15;
   const char* path = nullptr;
   for (int i = 1; i < argc; i++) {
     if (std::string(argv[i]) == "--format" && i + 1 < argc) fmt = argv[++i];
+    else if (std::string(argv[i]) == "--max-arity" && i + 1 < argc)
+      max_arity = static_cast<size_t>(std::atol(argv[++i]));
     else path = argv[i];
   }
   if (path == nullptr) { std::cerr << "no input file given\n"; return 1; }
@@ -153,22 +168,20 @@ int main(int argc, char** argv) {
     return 6;
   }
   WCSPInstance<>& inst = *instp;
-
-  //  toPolynomial expands an arity-k constraint into up to 2^k terms. 
-  //  immediate exhaustion. Normal to the CCG construction, not a defect and is repair
-  //  but it must not abort the process and take a whole batch run with it
-  ConstraintCompositeGraph<> ccg;
-  try {
-    WCSPInstance<>::constraint_t::Polynomial p;
-    for (const auto& c : inst.getConstraints()) c.toPolynomial(p);
-    ccg.addPolynomial(p);
-  } catch (const std::bad_alloc&) {
-    std::cout << "skipped -- out of memory building the CCG (constraint arity too high)\n";
-    return 6;
-  } catch (const std::exception& e) {
-    std::cout << "skipped -- CCG construction failed: " << e.what() << "\n";
-    return 6;
+  
+  {
+    size_t arity = max_constraint_arity(inst);
+    if (arity > max_arity) {
+      std::cout << "skipped -- constraint arity " << arity << " exceeds the limit of "
+                << max_arity << " (CCG would allocate 2^(2*arity) doubles)\n";
+      return 6;
+    }
   }
+
+  ConstraintCompositeGraph<> ccg;
+  WCSPInstance<>::constraint_t::Polynomial p;
+  for (const auto& c : inst.getConstraints()) c.toPolynomial(p);
+  ccg.addPolynomial(p);
   std::map<vid_t, bool> pre;
   ccg.simplify(pre);
   graph_t g = *ccg.getGraph();
