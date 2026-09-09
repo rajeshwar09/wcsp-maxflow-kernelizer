@@ -1,0 +1,9 @@
+Legend for arity-evalgm.tsv   (written 2026-09-09T18:20:32+05:30)
+
+instance    file name without extension
+family      parent folder of the instance
+max_arity   TRUE maximum constraint arity, measured on the parsed instance (largest number of variables in any single constraint); NA when the loader refused the file before measuring
+rc          exit code of the probe:
+              6 = arity measured, then refused by the --max-arity -1 guard (this is the EXPECTED code for a successful measurement)
+              5 = loader refused: a non-Boolean or domain-1 variable; run wcsp_collapse first if the file is domain-1
+              2 = file could not be opened

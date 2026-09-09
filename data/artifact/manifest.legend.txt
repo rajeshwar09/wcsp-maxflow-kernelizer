@@ -1,0 +1,13 @@
+Legend for manifest.tsv   (written 2026-09-09T16:39:02+05:30)
+
+relpath     path of the file relative to the new artifact folder
+collection  evalgm or uai
+family      parent folder of the instance (e.g. Auction, DBN, MMAP)
+format      wcsp (DIMACS) or uai
+nvars       number of variables declared in the header
+class       boolean    every domain is 2            -> usable directly
+            domain1    domains are only 1 and 2     -> usable after wcsp_collapse
+            multi      some domain is >= 3          -> unusable for ANY CCG method
+            unreadable the header did not parse
+copied      yes = present in the local artifact copy, no = left on the drive
+bytes       file size in bytes
