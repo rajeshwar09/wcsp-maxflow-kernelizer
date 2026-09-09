@@ -2,13 +2,13 @@
 #
 # run_artifact.sh -- evaluate the kernelizers over the published benchmark artifact
 #
-# The artifact mixes DIMACS and UAI, and 70.8 % of it has non-Boolean domains that no CCG method can express. This script filters to the usable subset, runs one
-# configuration over it, and writes one TSV row per instance.
+# The artifact mixes DIMACS and UAI, and most of it has non-Boolean domains that no CCG method can express
+# This script runs one configuration over a chosen set and writes one TSV row per instance
 #
-# Metric note: the published figures count RESOLVED VARIABLES after a SINGLE kernelization round. So --max-rounds defaults to 1 and the comparison column is
-# var_reduction, not vertex_reduction
+# note: the published figures count RESOLVED VARIABLES after a SINGLE kernelization round, so --max-rounds defaults to 1 and the comparison column is var_reduction_pct, not vertex_reduction_pct
 #
 set -uo pipefail
+. "$(dirname "$0")/lib/common.sh"
 
 ART=~/mtp/wcsp-maxflow/artifact
 SET="uai"
@@ -20,18 +20,18 @@ TIMEOUT=300
 MEMGB=18
 MAXVARS=0
 LIMIT=0
-OUTDIR=""
 RESUME=1
+RELIST=0
 
 usage() {
 cat <<'USAGE'
 Usage: ./scripts/run_artifact.sh [options] [set]
 
 Sets:
-  uai        the 160 Boolean UAI instances          (Tier A / B)
-  uai-mmap   MMAP only, 81 instances
-  uai-pr     PR only, 79 instances
-  evalgm     the 878 Boolean evalgm instances       (Tier C)
+  uai        the Boolean UAI instances
+  uai-mmap   MMAP only
+  uai-pr     PR only
+  evalgm     the Boolean evalgm instances
 
 Options:
   -k, --kernelizers LIST   comma list: none,cpu,gpu,lp     (default: lp,cpu)
@@ -43,15 +43,15 @@ Options:
       --max-vars N         skip instances above N variables (default: no cap)
       --limit N            stop after N instances (smoke test)
       --fresh              ignore existing rows, start over
-  -o, --outdir DIR         default: log/<date>/artifact
+      --relist             rebuild the cached instance list
       --artifact DIR       default: ~/mtp/wcsp-maxflow/artifact
   -h, --help
 
 Examples:
   ./scripts/run_artifact.sh --limit 5 uai              # smoke test
-  ./scripts/run_artifact.sh -k lp,cpu uai              # Tier A
-  ./scripts/run_artifact.sh -k cpu -p int -r 100 uai   # Tier B, perturbed
-  ./scripts/run_artifact.sh --max-vars 10000 evalgm    # Tier C, small end
+  ./scripts/run_artifact.sh -k lp,cpu uai
+  ./scripts/run_artifact.sh -k cpu -p int -r 100 uai
+  ./scripts/run_artifact.sh --max-vars 10000 evalgm
 USAGE
 }
 
@@ -66,7 +66,7 @@ while [ $# -gt 0 ]; do
     --max-vars)       MAXVARS="$2"; shift 2 ;;
     --limit)          LIMIT="$2"; shift 2 ;;
     --fresh)          RESUME=0; shift ;;
-    -o|--outdir)      OUTDIR="$2"; shift 2 ;;
+    --relist)         RELIST=1; shift ;;
     --artifact)       ART="$2"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
     -*)               echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -74,17 +74,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -z "$OUTDIR" ] && OUTDIR="log/$(date +%Y-%m-%d)/artifact"
-mkdir -p "$OUTDIR" data/artifact
+mf_init "artifact_${SET}"
+mkdir -p data/artifact
 
-LISTDIR=data/artifact
-RUNLOG="$OUTDIR/run_${SET}.log"
-
-# -------------------------------------------------- build the instance list once
+# ---------------------------------------------- the instance list (cached)
 #
-# Boolean domains only. For .uai the domain sizes are on line 3
-# for .wcsp they are field 3 of line 1
-# Cached, because scanning 3,000 files takes time
+# Boolean domains only. For .uai the domain sizes are on line 3; for .wcsp the max domain is field 3 of line 1
+# Cached in data/artifact/ because scanning thousands of files takes time
 
 build_list() {
   local set="$1" out="$2"
@@ -95,6 +91,7 @@ build_list() {
       [ "$set" = "uai-mmap" ] && dirs="$ART/uai/MMAP"
       [ "$set" = "uai-pr" ]   && dirs="$ART/uai/PR"
       : > "$out"
+      local d f
       for d in $dirs; do
         for f in "$d"/*.uai; do
           [ -f "$f" ] || continue
@@ -106,7 +103,7 @@ build_list() {
       ;;
     evalgm)
       : > "$out"
-      find "$ART/evalgm" -name '*.wcsp' | sort | while read -r f; do
+      find "$ART/evalgm" -name '*.wcsp' | sort | while IFS= read -r f; do
         read -r _ nv md _ _ < <(head -1 "$f")
         [ "$md" = "2" ] && printf '%s\t%s\n' "$f" "$nv" >> "$out"
       done
@@ -115,32 +112,51 @@ build_list() {
   esac
 }
 
-LIST="$LISTDIR/${SET}.list"
-if [ ! -s "$LIST" ]; then
-  echo "building instance list for '$SET' (one-time scan)..."
+LIST="data/artifact/${SET}.list"
+if [ "$RELIST" = "1" ] || [ ! -s "$LIST" ]; then
+  say "building instance list for '$SET' (one-time scan)..."
   build_list "$SET" "$LIST" || exit 2
 fi
 TOTAL=$(wc -l < "$LIST")
-echo "instances in set '$SET': $TOTAL"
 
-# ------------------------------------------------------------------- environment
-{
-  echo "date          : $(date -Iseconds)"
-  echo "set           : $SET  ($TOTAL instances)"
-  echo "kernelizers   : $KERNS"
-  echo "perturb       : $PERTURB  seed=$SEED"
-  echo "max rounds    : $MAXROUNDS"
-  echo "timeout       : $TIMEOUT s"
-  echo "mem limit     : ${MEMGB} GiB"
-  echo "max vars      : $([ "$MAXVARS" -gt 0 ] && echo "$MAXVARS" || echo none)"
-  echo "git commit    : $(git rev-parse --short HEAD 2>/dev/null)"
-  echo "git branch    : $(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
-} | tee "$OUTDIR/env_${SET}.txt"
-echo
+record_env "$OUT/env_artifact.txt"
+say "set           : $SET  ($TOTAL instances)"
+say "kernelizers   : $KERNS"
+say "perturb       : $PERTURB  seed=$SEED"
+say "max rounds    : $MAXROUNDS"
+say "timeout       : $TIMEOUT s"
+say "mem limit     : ${MEMGB} GiB"
+say "max vars      : $([ "$MAXVARS" -gt 0 ] && echo "$MAXVARS" || echo none)"
+say ""
 
-# ------------------------------------------------------------------------ run it
+# ------------------------------------------------------------------ run it
 
 HDR='instance	format	nvars	kernelizer	perturb	rounds	simplified	by_kernelizer	resolved_total	vars_left	var_reduction_pct	ccg_before	ccg_after	vertex_reduction_pct	kern_time_s	wall_s	peak_kb	status'
+
+write_legend() {
+  legend_for "$1" <<'EOF'
+instance              file name of the instance
+format                dimacs or uai
+nvars                 WCSP variables in the instance
+kernelizer            none | cpu (our max-flow) | gpu (our CUDA) | lp (Gurobi)
+perturb               weight perturbation mode: off | int | real
+rounds                kernelization rounds actually run
+simplified            variables resolved by simplify() BEFORE any kernelizer
+by_kernelizer         variables resolved by the kernelizer itself
+resolved_total        simplified + by_kernelizer
+vars_left             nvars - resolved_total
+var_reduction_pct     100 * resolved_total / nvars  -- the column the published figures use (single round, resolved variables)
+ccg_before            CCG vertices before kernelization
+ccg_after             CCG vertices after
+vertex_reduction_pct  CCG vertex reduction in percent
+kern_time_s           time spent inside the kernelizer only
+wall_s                wall-clock for the whole instance
+peak_kb               peak memory in kB
+status                ok | skip_domain (non-Boolean or domain-1)
+                         | skip_arity (constraint too wide for the CCG)
+                         | timeout | solver_timeout | oom | fail_rcN
+EOF
+}
 
 IFS_SAVE="$IFS"
 IFS=','
@@ -149,15 +165,15 @@ for k in $KERNS; do
 
   bin="./e2e_solve"
   [ "$k" = "gpu" ] && bin="./e2e_solve_gpu"
-  if [ ! -x "$bin" ]; then echo "SKIP kernelizer $k ($bin not built)"; IFS=','; continue; fi
+  if [ ! -x "$bin" ]; then say "SKIP kernelizer $k ($bin not built)"; IFS=','; continue; fi
 
   tag="${SET}_${k}_${PERTURB}_r${MAXROUNDS}"
-  TSV="$OUTDIR/${tag}.tsv"
+  TSV="$OUT/${tag}.tsv"
   [ "$RESUME" = "0" ] && rm -f "$TSV"
-  [ -s "$TSV" ] || printf '%s\n' "$HDR" > "$TSV"
+  if [ ! -s "$TSV" ]; then printf '%s\n' "$HDR" > "$TSV"; write_legend "$TSV"; fi
 
   done_n=$(( $(wc -l < "$TSV") - 1 ))
-  echo "=== $k / perturb=$PERTURB / rounds=$MAXROUNDS  ->  $TSV  ($done_n already done) ==="
+  say "=== $k / perturb=$PERTURB / rounds=$MAXROUNDS  ->  $TSV  ($done_n already done) ==="
 
   n=0
   while IFS=$'\t' read -r f nv; do
@@ -169,8 +185,8 @@ for k in $KERNS; do
     # resume: already recorded?
     if [ "$RESUME" = "1" ] && cut -f1 "$TSV" | grep -qxF "$name"; then continue; fi
 
-    out="$OUTDIR/.out.$$"
-    res="$OUTDIR/.res.$$"
+    out="$RAW/.out.$$"
+    res="$RAW/.res.$$"
 
     cmd=("$bin" --kernelizer "$k" --solver none --max-rounds "$MAXROUNDS"
          --perturb "$PERTURB" --seed "$SEED" "$f")
@@ -192,17 +208,9 @@ for k in $KERNS; do
     rc=$?
 
     g() { sed -n "s/.*$1[^:]*: *//p" "$out" | head -1 | tr -d '\r'; }
-    wall="$(awk '/Elapsed .wall clock/{print $NF}' "$res" 2>/dev/null)"
-    peak="$(awk '/Maximum resident set size/{print $NF}' "$res" 2>/dev/null)"
-
-    case $rc in
-      0)   status=ok ;;
-      4)   status=solver_timeout ;;
-      5)   status=skip_domain ;;
-      6)   status=skip_arity ;;
-      124) status=timeout ;;
-      *)   status="fail_rc$rc" ;;
-    esac
+    wall="$(wall_s "$res")"
+    peak="$(peak_kb "$res")"
+    status="$(status_of $rc)"
     grep -q 'std::bad_alloc\|Cannot allocate' "$out" 2>/dev/null && status=oom
 
     if [ "$status" = "ok" ]; then
@@ -233,9 +241,9 @@ for k in $KERNS; do
     rm -f "$out" "$res"
   done < "$LIST"
 
-  echo
+  say ""
   IFS=','
 done
 IFS="$IFS_SAVE"
 
-echo "done. output in $OUTDIR/"
+say "done. output in $OUT/"
