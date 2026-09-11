@@ -105,7 +105,7 @@ domain1)
 esac
 
 if [ -n "$ONLY" ]; then
-LIST=$(printf '%s\n' "$LIST" | awk -F'\t' -v want=",$ONLY," '{ n=split($1,p,"/"); b=p[n]; sub(/\.wcsp$/,"",b) if (index(want, "," b ",")) print }')
+LIST=$(printf '%s\n' "$LIST" | awk -F'\t' -v want=",$ONLY," '{ n=split($1,p,"/"); b=p[n]; sub(/\.wcsp$/,"",b); if (index(want, "," b ",")) print }')
 fi
 
 mf_init "collapse_audit_${SETNAME}"

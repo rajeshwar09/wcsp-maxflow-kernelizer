@@ -16,7 +16,7 @@
     A   header    collapsed variable count / domains / upper bound
     B   structure every collapsed contraint equals the original constraint with constant positions slicd out
     C   constant  folded constant that is re-derived which is equal to collapse reported
-    D   semantics cost_original(assignment, constants = 1) == const_collapsed (assignment) + folded_constant
+    D   semantics cost_original(assignment, constants = 0) == cost_collapsed (assignment) + folded_constant
     E   hygine    warnings for odd inputs that can hide some silent loss
   
   EXIT CODES
