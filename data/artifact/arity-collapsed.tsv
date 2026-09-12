@@ -363,3 +363,7 @@ test1	TimeTabling	20	6
 test2	TimeTabling	12	6
 test3	TimeTabling	20	6
 test4	TimeTabling	25	6
+normalized-mps-v2-20-10-p0033.opb.msat	MIPLib	8	6
+29180036-5408-11df-9f57-00163e7a6f5e_l2	PackupWeighted	15	6
+ec32fc68-7254-11e0-8436-00163e1e087d_l1	PackupWeighted	13	6
+rand695_l1	PackupWeighted	11	6

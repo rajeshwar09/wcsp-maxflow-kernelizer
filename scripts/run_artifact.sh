@@ -74,10 +74,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-mf_init "artifact_${SET}"
+#  set is either one of the built-in names, a directory, or a text file listing one instance path per line
+#  SETNAME is the short label used for the log, cached list and the output table, so a path never leaks into a filename
+case "$SET" in
+  uai|uai-mmap|uai-pr|evalgm) SETNAME="$SET" ;;
+  *) SETNAME="$(basename "${SET%/}")"; SETNAME="${SETNAME%.*}" ;;
+esac
+
+mf_init "artifact_${SETNAME}"
 mkdir -p data/artifact
 
-# ---------------------------------------------- the instance list (cached)
+# the instance list (cached)
 #
 # Boolean domains only. For .uai the domain sizes are on line 3; for .wcsp the max domain is field 3 of line 1
 # Cached in data/artifact/ because scanning thousands of files takes time
@@ -108,19 +115,48 @@ build_list() {
         [ "$md" = "2" ] && printf '%s\t%s\n' "$f" "$nv" >> "$out"
       done
       ;;
-    *) echo "unknown set: $set" >&2; return 1 ;;
+    *)
+      #  directory: every .wcsp/.uai below it. A text file: the paths it lists. Either way each entry is checked for Boolean domains, exactly as above
+      local src=""
+      if [ -d "$set" ]; then
+        src="$(find "$set" \( -name '*.wcsp' -o -name '*.uai' \) -type f | sort)"
+      elif [ -f "$set" ]; then
+        src="$(grep -v '^[[:space:]]*$' "$set")"
+      else
+        echo "unknown set: $set (not a built-in name, a directory or a file)" >&2
+        return 1
+      fi
+      : > "$out"
+      printf '%s\n' "$src" | while IFS= read -r f; do
+        [ -f "$f" ] || { echo "  missing: $f" >&2; continue; }
+        case "$f" in
+          *.uai)
+            if [ "$(sed -n '3p' "$f" | tr ' ' '\n' | grep -v '^$' | sort -u | tr -d '\n')" = "2" ]; then
+              printf '%s\t%s\n' "$f" "$(sed -n '2p' "$f" | tr -d ' \r')" >> "$out"
+            fi ;;
+          *)
+            nv="$(head -1 "$f" | awk '{print $2}')"
+            md="$(head -1 "$f" | awk '{print $3}')"
+            [ "$md" = "2" ] && printf '%s\t%s\n' "$f" "$nv" >> "$out" ;;
+        esac
+      done
+      ;;
   esac
 }
 
-LIST="data/artifact/${SET}.list"
+#  Built-in sets keep their cached list in data/artifact/ (it tells about benchmark). An ad-hoc directory or list file is rebuilt every run and its list lives with that day's results
+case "$SET" in
+  uai|uai-mmap|uai-pr|evalgm) LIST="data/artifact/${SETNAME}.list" ;;
+  *)                          LIST="$OUT/${SETNAME}.list"; RELIST=1 ;;
+esac
 if [ "$RELIST" = "1" ] || [ ! -s "$LIST" ]; then
-  say "building instance list for '$SET' (one-time scan)..."
+  say "building instance list for '$SETNAME' (scanning)..."
   build_list "$SET" "$LIST" || exit 2
 fi
 TOTAL=$(wc -l < "$LIST")
 
 record_env "$OUT/env_artifact.txt"
-say "set           : $SET  ($TOTAL instances)"
+say "set           : $SETNAME  ($TOTAL instances)"
 say "kernelizers   : $KERNS"
 say "perturb       : $PERTURB  seed=$SEED"
 say "max rounds    : $MAXROUNDS"
@@ -129,7 +165,7 @@ say "mem limit     : ${MEMGB} GiB"
 say "max vars      : $([ "$MAXVARS" -gt 0 ] && echo "$MAXVARS" || echo none)"
 say ""
 
-# ------------------------------------------------------------------ run it
+# run it
 
 HDR='instance	format	nvars	kernelizer	perturb	rounds	simplified	by_kernelizer	resolved_total	vars_left	var_reduction_pct	ccg_before	ccg_after	vertex_reduction_pct	kern_time_s	wall_s	peak_kb	status'
 
@@ -167,7 +203,7 @@ for k in $KERNS; do
   [ "$k" = "gpu" ] && bin="./e2e_solve_gpu"
   if [ ! -x "$bin" ]; then say "SKIP kernelizer $k ($bin not built)"; IFS=','; continue; fi
 
-  tag="${SET}_${k}_${PERTURB}_r${MAXROUNDS}"
+  tag="${SETNAME}_${k}_${PERTURB}_r${MAXROUNDS}"
   TSV="$OUT/${tag}.tsv"
   [ "$RESUME" = "0" ] && rm -f "$TSV"
   if [ ! -s "$TSV" ]; then printf '%s\n' "$HDR" > "$TSV"; write_legend "$TSV"; fi
