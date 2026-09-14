@@ -147,8 +147,14 @@ build_list() {
 #  Built-in sets keep their cached list in data/artifact/ (it tells about benchmark). An ad-hoc directory or list file is rebuilt every run and its list lives with that day's results
 case "$SET" in
   uai|uai-mmap|uai-pr|evalgm) LIST="data/artifact/${SETNAME}.list" ;;
-  *)                          LIST="$OUT/${SETNAME}.list"; RELIST=1 ;;
+  *)                          LIST="$OUT/${SETNAME}.scanned.list"; RELIST=1 ;;
 esac
+#  The scanned list must never be the file the user handed us: build_list truncates its output, which would destroy the input
+if [ "$(readlink -f "$LIST" 2>/dev/null)" = "$(readlink -f "$SET" 2>/dev/null)" ]; then
+  echo "error: the scanned list would overwrite your input list ($SET)." >&2
+  echo "       keep the input outside $OUT/ -- data/artifact/ is a good home." >&2
+  exit 2
+fi
 if [ "$RELIST" = "1" ] || [ ! -s "$LIST" ]; then
   say "building instance list for '$SETNAME' (scanning)..."
   build_list "$SET" "$LIST" || exit 2
