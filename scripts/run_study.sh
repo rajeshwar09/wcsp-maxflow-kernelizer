@@ -71,7 +71,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "$PHASE" in
-  build|lattice|compare|all) ;;
+  build|gates|lattice|compare|all) ;;
   "") echo "error: no phase given" >&2; usage; exit 2 ;;
   *)  echo "error: unknown phase '$PHASE'" >&2; usage; exit 2 ;;
 esac
@@ -321,6 +321,7 @@ do_summary() {
 
 case "$PHASE" in
   build)   [ "$DO_BUILD" = "1" ] && build_core ;;
+  gates)   build_core; build_gates ;;
   lattice) [ "$DO_BUILD" = "1" ] && build_core; do_lattice; do_summary ;;
   compare) [ "$DO_BUILD" = "1" ] && build_core; do_compare; do_summary ;;
   all)     [ "$DO_BUILD" = "1" ] && build_core; do_lattice; do_compare; do_summary ;;
