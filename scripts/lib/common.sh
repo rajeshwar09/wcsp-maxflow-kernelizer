@@ -100,7 +100,13 @@ timed() {
 
 field()  { sed -n "s/.*$1[^:]*: *//p" "$2" | head -1 | tr -d '\r'; }
 paired() { sed -n "s/.*$1[^:]*: *\([0-9][0-9]*\)  *(\([0-9.e+-]*\)%).*/\1\t\2/p" "$2" | head -1; }
-wall_s() { awk '/Elapsed .wall clock/{print $NF}' "$1" 2>/dev/null; }
+wall_s() {
+  awk '/Elapsed .wall clock/ { n = split($NF, p, ":");
+         if (n == 3) printf "%.2f\n", p[1]*3600 + p[2]*60 + p[3];
+         else if (n == 2) printf "%.2f\n", p[1]*60 + p[2];
+         else printf "%.2f\n", p[1]+0;
+         exit }' "$1" 2>/dev/null
+}
 peak_kb(){ awk '/Maximum resident set size/{print $NF}' "$1" 2>/dev/null; }
 
 # exit-code -> status word, one vocabulary for every script
