@@ -111,8 +111,9 @@ build_list() {
     evalgm)
       : > "$out"
       find "$ART/evalgm" -name '*.wcsp' | sort | while IFS= read -r f; do
-        read -r _ nv md _ _ < <(head -1 "$f")
-        [ "$md" = "2" ] && printf '%s\t%s\n' "$f" "$nv" >> "$out"
+        if [ "$(sed -n '2p' "$f" | tr ' ' '\n' | grep -v '^$' | sort -u | tr -d '\n')" = "2" ]; then
+          printf '%s\t%s\n' "$f" "$(head -1 "$f" | awk '{print $2}')" >> "$out"
+        fi
       done
       ;;
     *)
