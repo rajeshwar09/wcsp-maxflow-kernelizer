@@ -172,6 +172,18 @@ namespace maxflow {
           }
         }
 
+        // How often to run global relabel?
+        int gr_period = 1;
+        {
+          const char* env_gr = std::getenv("MAXFLOW_GR_PERIOD");
+          if (env_gr != nullptr && std::atoi(env_gr) > 0) {
+            gr_period = std::atoi(env_gr);
+          }
+        }
+
+        int outer_iter = 0;
+        bool heights_fresh = false;
+
         //  Algorithm 1: main loop
         int h_flag;
         while (true) {
@@ -196,15 +208,26 @@ namespace maxflow {
           MAXFLOW_CUDA_CHECK(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
 #endif
           if (!h_flag) {
-            break;  // no active vertex => done
+            // No active vertices. forcing again to refesh and look again before declaring the solve finished
+            if (heights_fresh) {
+              break;
+            }
+
+            outer_iter = 0;
+            h_flag = 1;
           }
 
           //  Algorithm 4: global relabel (backwards BFS, data-driven)
 #ifdef MAXFLOW_PROFILE
           auto tb0 = clk();
 #endif
-          gpu_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
-          MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+          const bool do_global_relabel = (outer_iter % gr_period == 0);
+          heights_fresh = do_global_relabel;
+
+          if (do_global_relabel) {
+            gpu_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
+            MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+          
 
           if (!use_frontier_bfs) {
             //  Topology-driven: |V| threads per layer, most exit immediately
@@ -265,6 +288,7 @@ namespace maxflow {
               std::swap(d_frontier_in, d_frontier_out);
             }
           }
+          }
 
 #ifdef MAXFLOW_PROFILE
           t_bfs += secs(tb0, clk());
@@ -285,6 +309,7 @@ namespace maxflow {
 #ifdef MAXFLOW_PROFILE
           t_remove += secs(tr0, clk());
 #endif
+          outer_iter++;
         }
 
 #ifdef MAXFLOW_PROFILE
@@ -294,7 +319,7 @@ namespace maxflow {
             tot = 1e-12;
           }
           std::fprintf(stderr, "\n=== GPU topology profile ===\n");
-          std::fprintf(stderr, "  graph              : V=%d  E=%d  kernel_cycles=%d\n", V, E, kernel_cycles);
+          std::fprintf(stderr, "  graph              : V=%d  E=%d  kernel_cycles=%d  gr_period=%d\n", V, E, kernel_cycles, gr_period);
           std::fprintf(stderr, "  outer iterations   : %ld\n", n_outer);
           std::fprintf(stderr, "  BFS levels (total) : %ld\n", n_bfs_levels);
           std::fprintf(stderr, "  kernel launches    : %ld\n", n_bfs_levels + 4 * n_outer);
