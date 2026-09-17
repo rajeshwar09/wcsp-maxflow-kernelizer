@@ -172,8 +172,8 @@ namespace maxflow {
           }
         }
 
-        // How often to run global relabel?
-        int gr_period = 1;
+        // How often to run global relabel? From experments, 100
+        int gr_period = 100;
         {
           const char* env_gr = std::getenv("MAXFLOW_GR_PERIOD");
           if (env_gr != nullptr && std::atoi(env_gr) > 0) {
