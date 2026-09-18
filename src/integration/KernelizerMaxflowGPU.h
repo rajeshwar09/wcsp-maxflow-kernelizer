@@ -23,6 +23,7 @@
 #include "src/common/types.h"
 #include "src/cpu/graph_csr.h"
 #include "src/integration/perturbation.h"
+#include "src/common/stage_timer.h"
 
 #include "src/gpu/maxflow_gpu_topology.h"
 
@@ -64,6 +65,7 @@ namespace maxflow {
         auto vertex_id_map = get(vertex_name, g);
         auto vertex_weight_map = get(vertex_weight, g);
 
+        double _t = stage_now();
     
         //  1 : Collect CCG vertices and build index mapping
         //
@@ -85,6 +87,8 @@ namespace maxflow {
         }
 
         int n = static_cast<int>(ccg_vertices.size());
+
+        _t = stage_mark("kern.collect", _t);
 
         //  Edge case : if the graph is empty, nothing to kernelize
         if (n == 0) {
@@ -160,7 +164,8 @@ namespace maxflow {
         flow_network<cap_t> net;
         net.build_from_edges(flow_n, flow_source, flow_sink, flow_edges);
 
-    
+        _t = stage_mark("kern.build_flownet", _t);
+        
         //  3 : Solve max-flow ON THE GPU
     
         //
@@ -168,6 +173,8 @@ namespace maxflow {
 
         gpu_topology_solver solver(net);
         solver.solve();
+
+        _t = stage_mark("kern.maxflow", _t);
 
         //  4 : Extract NT classification from min-cut    
         //
@@ -190,6 +197,8 @@ namespace maxflow {
           }
           //  else: both on same side => x = 0.5, keep as 2
         }
+
+        _t = stage_mark("kern.classify", _t);
 
         //  5 : Modify the CCG graph    
 
@@ -214,6 +223,8 @@ namespace maxflow {
           clear_vertex(v, g);
           remove_vertex(v, g);
         }
+
+        stage_mark("kern.apply", _t);
       }
 
     private:

@@ -57,6 +57,7 @@ using std::isinf;
 
 #include "src/integration/perturbation.h"
 #include "src/integration/KernelizerMaxflow.h"
+#include "src/common/stage_timer.h"
 
 #ifdef USE_GPU
 #include "src/integration/KernelizerMaxflowGPU.h"
@@ -422,6 +423,7 @@ static int run(int argc, char** argv) {
     std::cout << "[e2e] WARNING           : time limit reached, result may be suboptimal\n";
   std::cout << "[e2e] kernel time       : " << kern_time << " s\n";
   std::cout << "[e2e] solve time        : " << solve_time << " s\n";
+  maxflow::stage_timer::instance().dump(std::cout);  
   std::cout << "[e2e] TOTAL TIME        : " << secs(t_all0, t_all1) << " s\n";
   return timed_out ? 4 : 0;
 }
