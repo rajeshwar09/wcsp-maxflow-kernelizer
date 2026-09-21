@@ -187,3 +187,23 @@ build_gates() {
   fi
   say ""
 }
+
+
+#  never lose a result
+
+# archive_if_exists FILE.tsv
+#
+#       pipeline_x_ilp_r1.tsv                          <- the new run
+#       pipeline_x_ilp_r1.superseded-181502.tsv        <- the earlier one, kept
+archive_if_exists() {
+  local f="$1"
+  [ -e "$f" ] || return 0
+  local stamp base
+  stamp="$(date +%H%M%S)"
+  base="${f%.tsv}"
+  mv "$f" "${base}.superseded-${stamp}.tsv"
+  if [ -e "${base}.legend.txt" ]; then
+    cp "${base}.legend.txt" "${base}.superseded-${stamp}.legend.txt"
+  fi
+  say "earlier table kept as: ${base}.superseded-${stamp}.tsv"
+}
