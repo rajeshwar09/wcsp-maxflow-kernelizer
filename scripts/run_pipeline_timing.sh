@@ -9,10 +9,11 @@ ART=~/mtp/wcsp-maxflow/artifact
 SET="uai"
 KERNS="none,lp,cpu,gpu"
 SOLVER="ilp"
+SOLVELIMIT=0
 PERTURB="off"
 SEED=1
 MAXROUNDS=1
-TIMEOUT=900
+TIMEOUT=3600
 MEMGB=18
 MAXVARS=0
 LIMIT=0
@@ -56,6 +57,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -k|--kernelizers) KERNS="$2"; shift 2 ;;
     -s|--solver)      SOLVER="$2"; shift 2 ;;
+    --solve-limit)    SOLVELIMIT="$2"; shift 2 ;;
     -p|--perturb)     PERTURB="$2"; shift 2 ;;
     --seed)           SEED="$2"; shift 2 ;;
     -r|--max-rounds)  MAXROUNDS="$2"; shift 2 ;;
@@ -127,7 +129,7 @@ done
 TOTAL=$(wc -l < "$LIST")
 
 TSV="$OUT/pipeline_${SETNAME}_${SOLVER}_r${MAXROUNDS}.tsv"
-[ "$RESUME" = "0" ] && rm -f "$TSV"
+[ "$RESUME" = "0" ] && archive_if_exists "$TSV"
 
 HDR='instance	rep	format	kernelizer	solver	perturb	nvars	rounds	simplified	by_kernelizer	resolved_total	var_reduction_pct	ccg_vertices_before	ccg_edges_before	ccg_vertices_after	vertex_reduction_pct	final_optimum	status	t_parse	t_topolynomial	t_addpolynomial	t_getgraph_copy	t_ccg_build	t_simplify	t_kernelize	t_solve	k_collect	k_build_flownet	k_maxflow	k_classify	k_apply	k_other	peak_kb	wall_s	t_total'
 
@@ -155,7 +157,12 @@ ccg_edges_before      CCG edges before kernelization
 ccg_vertices_after    CCG vertices after kernelization
 vertex_reduction_pct  CCG vertex reduction in percent
 final_optimum         objective from the exact solve, or a marker if it did not finish
-status                ok | solver_timeout | skip_domain | skip_arity | timeout | oom | fail_rcN
+status                ok              solved to proven optimality
+                      solve_limit_hit the solver stopped at --solve-limit and returned a SUBOPTIMAL objective. Timings are valid, the objective is not
+                      solver_timeout  the solver gave up at --solve-limit with no answer
+                      kernel_timeout  the kernelizer itself hit the limit (lp only)
+                      timeout         killed from outside by -t. NO timings survive
+                      skip_domain | skip_arity | oom | fail_rcN   see the other scripts
 
 PIPELINE STAGE TIMES, seconds  (these are the stages of the whole run)
 t_parse               read the .wcsp/.uai file and build the WCSP instance
@@ -191,6 +198,7 @@ record_env "$OUT/env_pipeline.txt"
 say "set           : $SETNAME  ($TOTAL Boolean instances)"
 say "kernelizers   : $KERNS"
 say "solver        : $SOLVER"
+say "solve limit   : $([ "$SOLVELIMIT" -gt 0 ] && echo "${SOLVELIMIT} s (graceful)" || echo none)"
 say "perturb       : $PERTURB  seed=$SEED"
 say "max rounds    : $MAXROUNDS"
 say "repeats       : $REPEAT"
@@ -230,7 +238,11 @@ while [ "$rep" -le "$REPEAT" ]; do
       res="$RAW/.res.$$"
 
       cmd=("$bin" --kernelizer "$k" --solver "$SOLVER" --max-rounds "$MAXROUNDS"
-           --perturb "$PERTURB" --seed "$SEED" "$f")
+           --perturb "$PERTURB" --seed "$SEED")
+      if [ "$SOLVELIMIT" -gt 0 ]; then
+        cmd+=(--time-limit "$SOLVELIMIT")
+      fi
+      cmd+=("$f")
 
       if [ "$MEMGB" -gt 0 ]; then
         ( ulimit -v $((MEMGB * 1024 * 1024))
@@ -250,6 +262,12 @@ while [ "$rep" -le "$REPEAT" ]; do
 
       status="$(status_of $rc)"
       grep -q 'std::bad_alloc\|Cannot allocate' "$out" 2>/dev/null && status=oom
+
+      grep -q '^\[solve\] TIMEOUT' "$out" 2>/dev/null && status=solver_timeout
+      if [ "$status" = "ok" ] && grep -q 'time limit reached, result may be suboptimal' "$out" 2>/dev/null; then
+        status=solve_limit_hit
+      fi
+      grep -q '^\[kernel\] TIMEOUT' "$out" 2>/dev/null && status=kernel_timeout
 
       fmt="$(g_field e2e format "$out")"
       rounds="$(g_field kernel rounds "$out")"
@@ -316,37 +334,6 @@ done
 
 # summary
 
-say "=== Totals per kernelizer (seconds) ==="
-say "$(printf '  %-6s %5s %10s %10s %10s %10s %10s %10s' kern n parse ccg_build simplify kernelize solve TOTAL)"
-awk -F'\t' 'NR>1 && $18=="ok" {
-    k=$4; n[k]++;
-    p[k]+=$19; cg[k]+=$23; sm[k]+=$24; ke[k]+=$25; so[k]+=$26; to[k]+=$35 }
-  END{ for (k in n) printf "  %-6s %5d %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n", k, n[k], p[k], cg[k], sm[k], ke[k], so[k], to[k] }' "$TSV" | sort | tee -a "$RUNLOG"
-
-say ""
-say "=== INSIDE KERNELIZATION, totals per kernelizer (seconds) ==="
-say "$(printf '  %-6s %5s %10s %10s %10s %10s %10s %10s %10s' kern n collect flownet MAXFLOW classify apply other kernelize)"
-awk -F'\t' 'NR>1 && $18=="ok" && $27!="NA" {
-    k=$4; n[k]++; c[k]+=$27; b[k]+=$28; m[k]+=$29; cl[k]+=$30; a[k]+=$31; o[k]+=$32; t[k]+=$25 }
-  END{ for (k in n) printf "  %-6s %5d %10.3f %10.3f %10.3f %10.3f %10.3f %10.3f %10.3f\n", k, n[k], c[k], b[k], m[k], cl[k], a[k], o[k], t[k] }' "$TSV" | sort | tee -a "$RUNLOG"
-
-say ""
-say "=== (kernelize + solve, vs the none control) ==="
-say "$(printf '  %-6s %5s %14s %14s' kern n kernel+solve 'vs control')"
-awk -F'\t' 'NR>1 && $18=="ok" { k=$4; n[k]++; s[k]+=$25+$26 }
-  END{ base = s["none"];
-       for (k in n) {
-         if (k=="none") { printf "  %-6s %5d %14.2f %14s\n", k, n[k], s[k], "(control)" }
-         else if (base > 0) { printf "  %-6s %5d %14.2f %13.2fx\n", k, n[k], s[k], base/s[k] }
-         else { printf "  %-6s %5d %14.2f %14s\n", k, n[k], s[k], "-" } } }' "$TSV" | sort | tee -a "$RUNLOG"
-
-say ""
-say "=== MEASUREMENT SPREAD across repeats ==="
-awk -F'\t' 'NR>1 && $18=="ok" { key=$1"|"$4; r=$35+0; if (!(key in lo) || r<lo[key]) lo[key]=r; if (r>hi[key]) hi[key]=r; c[key]++ }
-  END{ worst=0; nn=0;
-       for (key in c) { if (c[key]>1 && lo[key]>0) { sp=100*(hi[key]-lo[key])/lo[key]; nn++; if (sp>worst) { worst=sp; wk=key } } }
-       if (nn==0) { print "  single run per configuration -- re-run with --repeat 3 for a spread"; }
-       else { printf "  configurations with repeats: %d   worst spread: %.1f%%  (%s)\n", nn, worst, wk } }' "$TSV" | tee -a "$RUNLOG"
-
+"$REPO/scripts/summarize_pipeline.sh" "$TSV" | tee -a "$RUNLOG"
 say ""
 say "done. table: $TSV"

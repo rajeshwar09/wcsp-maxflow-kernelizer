@@ -299,6 +299,7 @@ static int run(int argc, char** argv) {
   //  earlier harnesses in this project ran a single pass and so under-reported what kernelization achieves
   double kern_time = 0.0;
   long rounds = 0;
+  bool kern_aborted = false;
   if (kern != "none") {
     size_t prev = static_cast<size_t>(-1);
     for (long i = 1; i <= max_rounds && prev != assignments.size(); i++) {
@@ -310,27 +311,42 @@ static int run(int argc, char** argv) {
       pc.seed    = pcfg_base.seed + static_cast<std::uint64_t>(i);
       pc.verbose = (i == 1);
 
-      if (kern == "cpu") {
-        maxflow::KernelizerMaxflow<> k(pc);
-        k.kernelize(g, assignments);
-      }
+      try {
+        if (kern == "cpu") {
+          maxflow::KernelizerMaxflow<> k(pc);
+          k.kernelize(g, assignments);
+        }
 #ifdef USE_GPU
-      else if (kern == "gpu") {
-        maxflow::KernelizerMaxflowGPU<> k(pc);
-        k.kernelize(g, assignments);
-      }
+        else if (kern == "gpu") {
+          maxflow::KernelizerMaxflowGPU<> k(pc);
+          k.kernelize(g, assignments);
+        }
 #endif
 #ifdef HAVE_GUROBI
-      else if (kern == "lp") {
-        KernelizerLinearProgramming<> k(new LinearProgramSolverGurobi());
-        k.kernelize(g, assignments);
+        else if (kern == "lp") {
+          KernelizerLinearProgramming<> k(new LinearProgramSolverGurobi());
+          k.kernelize(g, assignments);
+        }
+#endif
+      }
+#ifdef HAVE_GUROBI
+      catch (const LinearProgramSolver::TimeOutException&) {
+        kern_aborted = true;
+        std::cout << "[kernel] TIMEOUT        : kernelizer exceeded the time limit\n";
       }
 #endif
+      catch (const std::exception& e) {
+        kern_aborted = true;
+        std::cout << "[kernel] ERROR          : " << e.what() << "\n";
+      }
 
       auto k1 = clk::now();
       double dt = secs(k0, k1);
       kern_time += dt;
       rounds = i;
+      if (kern_aborted) {
+        break;
+      }
 
       std::cout << "[kernel] round " << i
                 << " : resolved=" << assignments.size()
