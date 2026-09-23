@@ -141,12 +141,12 @@ if has licence; then
   say ""
 fi
 
-# gate (a): kernel agreement
+# gate (a): kernel agreement + LP certificates
 
 if has gate; then
-  hr; say "=== stage gate (a): kernel agreement, instances up to $GATE_MAXVARS vars ==="
+  hr; say "=== stage gate (a): kernel agreement and LP certificates, instances up to $GATE_MAXVARS vars ==="
   KV="$OUT/cplex_gate_kernels.tsv"
-  printf 'instance\tnvars\tdecided_mf\tdecided_lp\tdecided_cplex\topposite_mf_lp\topposite_mf_cplex\topposite_lp_cplex\tverdict\n' > "$KV"
+  printf 'instance\tnvars\tdecided_mf\tdecided_lp\tdecided_cplex\tlp_obj_gurobi\tlp_obj_cplex\tnonhalf_gurobi\tnonhalf_cplex\tviolation_gurobi\tviolation_cplex\topposite_mf_lp\topposite_mf_cplex\tties_lp_cplex\tverdict\n' > "$KV"
 
   opposite() {   # opposite <dumpA> <dumpB> <log>  -> prints the OPPOSITE count, or NA
     if [ -s "$1" ] && [ -s "$2" ]; then
@@ -155,6 +155,10 @@ if has gate; then
     else
       echo NA
     fi
+  }
+  lpc() {        # lpc <label> <log>  -> value of an [lp-check] line, or NA
+    local v; v="$(sed -n "s/^\[lp-check\] $1 *: *//p" "$2" 2>/dev/null | head -1)"
+    [ -n "$v" ] && echo "$v" || echo NA
   }
 
   while IFS=$'\t' read -r nv f; do
@@ -170,32 +174,66 @@ if has gate; then
       if [ "$rc" -eq 0 ] && [ -s "$dumpf" ]; then dec[$m]="$(wc -l < "$dumpf")"; else dec[$m]="$(status_of "$rc")"; rm -f "$dumpf"; fi
       say "  $(printf '%-24s %-6s decided=%s' "$name" "$m" "${dec[$m]}")"
     done
+
+    LG="$RAW/gate_lp_${name}.log"; LC="$RAW/gate_cplex_${name}.log"
+    so_g="$(lpc 'solver objective' "$LG")";     so_c="$(lpc 'solver objective' "$LC")"
+    ob_g="$(lpc 'recomputed objective' "$LG")"; ob_c="$(lpc 'recomputed objective' "$LC")"
+    nh_g="$(lpc 'count other' "$LG")";          nh_c="$(lpc 'count other' "$LC")"
+    vi_g="$(lpc 'max violation' "$LG")";        vi_c="$(lpc 'max violation' "$LC")"
+
     o_ml="$(opposite "$RAW/gate_mf_${name}.txt" "$RAW/gate_lp_${name}.txt"    "$RAW/gate_cmp_mf_lp_${name}.log")"
     o_mc="$(opposite "$RAW/gate_mf_${name}.txt" "$RAW/gate_cplex_${name}.txt" "$RAW/gate_cmp_mf_cplex_${name}.log")"
     o_lc="$(opposite "$RAW/gate_lp_${name}.txt" "$RAW/gate_cplex_${name}.txt" "$RAW/gate_cmp_lp_cplex_${name}.log")"
-    if [ "$o_ml" = NA ] || [ "$o_mc" = NA ] || [ "$o_lc" = NA ]; then v=INCOMPLETE
-    elif [ "$o_ml" -eq 0 ] && [ "$o_mc" -eq 0 ] && [ "$o_lc" -eq 0 ]; then v=MATCH
-    else v=MISMATCH; fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$nv" "${dec[mf]}" "${dec[lp]}" "${dec[cplex]}" "$o_ml" "$o_mc" "$o_lc" "$v" >> "$KV"
+
+    #  The verdict, in words:
+    #    both LP solutions feasible (violation <= 1e-6) and half-integral (no value other than 0, 0.5, 1),
+    #    each solver's reported objective equals the objective recomputed from its values,
+    #    and Gurobi's and CPLEX's objectives are equal  =>  both are OPTIMAL LP solutions, so each LP kernel is safe;
+    #    max-flow contradicts neither;
+    #    Gurobi vs CPLEX opposites are then ties between two different optimal solutions, reported but allowed
+    v="$(awk -v sg="$so_g" -v sc="$so_c" -v og="$ob_g" -v oc="$ob_c" -v ng="$nh_g" -v nc="$nh_c" \
+             -v vg="$vi_g" -v vc="$vi_c" -v ml="$o_ml" -v mc="$o_mc" -v lc="$o_lc" '
+      function close_to(a, b) { d = a - b; if (d < 0) d = -d; m = (a < 0 ? -a : a); if (m < 1) m = 1; return d <= 1e-6 * m }
+      BEGIN {
+        if (sg == "NA" || sc == "NA" || og == "NA" || oc == "NA" || ng == "NA" || nc == "NA" ||
+            vg == "NA" || vc == "NA" || ml == "NA" || mc == "NA" || lc == "NA") { print "INCOMPLETE"; exit }
+        ok = (ng + 0 == 0) && (nc + 0 == 0) && (vg + 0 <= 1e-6) && (vc + 0 <= 1e-6) &&
+             close_to(sg + 0, og + 0) && close_to(sc + 0, oc + 0) && close_to(og + 0, oc + 0) &&
+             (ml + 0 == 0) && (mc + 0 == 0)
+        print (ok ? "MATCH" : "MISMATCH")
+      }')"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$nv" "${dec[mf]}" "${dec[lp]}" "${dec[cplex]}" \
+      "$ob_g" "$ob_c" "$nh_g" "$nh_c" "$vi_g" "$vi_c" "$o_ml" "$o_mc" "$o_lc" "$v" >> "$KV"
     unset dec
   done < "$LIST"
 
   legend_for "$KV" <<'LEG'
 One row per instance. max-flow, Gurobi LP and CPLEX LP each kernelize the SAME constraint composite graph (built once per
-kernelizer, from the same file, with the same simplify() pass), and their decisions are compared variable by variable.
-instance            file name
-nvars               WCSP variables
-decided_mf          variables fixed to 0 or 1 by our max-flow kernelizer (includes those simplify() fixed first)
-decided_lp          the same for the Gurobi LP kernelizer
-decided_cplex       the same for the CPLEX LP kernelizer (a status word instead of a number means that kernelizer did not finish: timeout, oom, fail_rcN)
-opposite_mf_lp      variables decided by BOTH max-flow and Gurobi but with OPPOSITE values
-opposite_mf_cplex   the same for max-flow vs CPLEX
-opposite_lp_cplex   the same for Gurobi vs CPLEX
-verdict             MATCH       every opposite count is 0: the kernelizers may decide different NUMBERS of variables (the LP has
-                                several optimal solutions and each solver may return a different one), but they never contradict
-                                each other -- the accepted correctness criterion for this project
-                    MISMATCH    some variable got opposite values -- a defect, not explainable by non-unique optima
-                    INCOMPLETE  a kernelizer did not finish, nothing to compare
+kernelizer, from the same file, with the same simplify() pass). The two LP solutions are certified independently of the
+solvers, and all three kernels are compared variable by variable.
+instance           file name
+nvars              WCSP variables
+decided_mf         variables fixed to 0 or 1 by our max-flow kernelizer (includes those simplify() fixed first)
+decided_lp         the same for the Gurobi LP kernelizer
+decided_cplex      the same for the CPLEX LP kernelizer (a status word instead of a number means that kernelizer did not finish: timeout, oom, fail_rcN)
+lp_obj_gurobi      LP objective of Gurobi's solution, recomputed from the values it returned (sum of weight x value)
+lp_obj_cplex       the same for CPLEX. Equal objectives = both solutions are OPTIMAL for the same LP
+nonhalf_gurobi     values in Gurobi's solution that are not 0, 0.5 or 1 (must be 0: optimal vertex solutions of this LP are half-integral)
+nonhalf_cplex      the same for CPLEX
+violation_gurobi   largest amount by which any x_u + x_v >= 1 constraint is violated (must be <= 1e-6: the solution is feasible)
+violation_cplex    the same for CPLEX
+opposite_mf_lp     variables decided by BOTH max-flow and Gurobi, with OPPOSITE values (must be 0)
+opposite_mf_cplex  the same for max-flow vs CPLEX (must be 0)
+ties_lp_cplex      variables Gurobi and CPLEX decided with opposite values. ALLOWED: an LP can have several optimal solutions,
+                   and in a tie (e.g. two neighbouring vertices of equal weight) one solver may pick u and the other v. By the
+                   Nemhauser-Trotter persistency theorem EACH optimal half-integral solution gives a safe kernel on its own;
+                   two such kernels need not agree with each other. Max-flow deciding fewer variables and contradicting
+                   neither is consistent with it fixing only what every optimal solution agrees on
+verdict            MATCH      both LP solutions certified optimal (feasible, half-integral, equal objectives, solver objective =
+                              recomputed objective) and max-flow contradicts neither
+                   MISMATCH   one of those checks failed -- a defect, investigate
+                   INCOMPLETE a kernelizer did not finish, nothing to compare
 LEG
   show_tsv "$KV" | tee -a "$RUNLOG"
   grep -q 'MISMATCH' "$KV" && fail "gate (a) found a MISMATCH -- later stages not run (see $KV)"
