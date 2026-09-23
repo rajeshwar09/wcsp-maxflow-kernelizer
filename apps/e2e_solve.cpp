@@ -70,6 +70,12 @@ using std::isinf;
 #include "third_party/wcsp-solver/src/KernelizerLinearProgramming.h"
 #endif
 
+#ifdef HAVE_CPLEX
+#include "third_party/wcsp-solver/src/LinearProgramSolver.h"
+#include "third_party/wcsp-solver/src/LinearProgramSolverCplex.h"
+#include "third_party/wcsp-solver/src/KernelizerLinearProgramming.h"
+#endif
+
 typedef ConstraintCompositeGraph<> ccg_t;
 typedef ccg_t::graph_t graph_t;
 typedef ccg_t::variable_id_t vid_t;
@@ -114,6 +120,7 @@ static void usage(const char* prog) {
     << "  cpu  : max-flow kernelizer, CPU push-relabel\n"
     << "  gpu  : max-flow kernelizer, CUDA push-relabel (needs -DUSE_GPU build)\n"
     << "  lp   : Gurobi LP-relaxation kernelizer (needs -DHAVE_GUROBI build)\n\n"
+    << "  cplex: CPLEX LP-relaxation kernelizer (needs -DHAVE_CPLEX build)\n"
     << "  ilp  : exact integer program via Gurobi -- objectives are comparable\n"
     << "  mp   : min-sum message passing, a heuristic that may not converge\n"
     << "  none : stop after kernelization, report no objective\n\n"
@@ -156,7 +163,7 @@ static int run(int argc, char** argv) {
   }
   if (path == nullptr) { usage(argv[0]); return 1; }
 
-  if (kern != "none" && kern != "cpu" && kern != "gpu" && kern != "lp") {
+  if (kern != "none" && kern != "cpu" && kern != "gpu" && kern != "lp" && kern != "cplex") {
     std::cerr << "bad --kernelizer: " << kern << "\n"; return 1;
   }
   if (solver != "ilp" && solver != "mp" && solver != "none") {
@@ -168,6 +175,9 @@ static int run(int argc, char** argv) {
 #ifndef HAVE_GUROBI
   if (kern == "lp")     { std::cerr << "this binary was built without -DHAVE_GUROBI\n"; return 3; }
   if (solver == "ilp")  { std::cerr << "this binary was built without -DHAVE_GUROBI\n"; return 3; }
+#endif
+#ifndef HAVE_CPLEX
+  if (kern == "cplex")  { std::cerr << "this binary was built without -DHAVE_CPLEX\n"; return 3; }
 #endif
 
   //  Input format. `auto` decides from the extension: .uai -> UAI, else DIMACS.
@@ -194,7 +204,7 @@ static int run(int argc, char** argv) {
   pcfg_base.delta  = pdelta;
   pcfg_base.seed   = pseed;
 
-  if (pcfg_base.mode != maxflow::perturb_mode::off && (kern == "lp" || kern == "none")) {
+  if (pcfg_base.mode != maxflow::perturb_mode::off && (kern == "lp" || kern == "cplex" || kern == "none")) {
     std::cerr << "note: --perturb has no effect with --kernelizer " << kern << "\n";
   }
 
@@ -227,7 +237,7 @@ static int run(int argc, char** argv) {
 
   auto t_all0 = clk::now();
 
-  // ---- parse -------------------------------------------------------------
+  // parse
   std::ifstream in(path);
   if (!in) { std::cerr << "cannot open " << path << "\n"; return 2; }
   auto t0 = clk::now();
@@ -243,7 +253,7 @@ static int run(int argc, char** argv) {
   auto t1 = clk::now();
   std::cout << "[stage] parse           : " << secs(t0, t1) << " s\n";
 
-  // ---- arity guard -------------------------------------------------------
+  // arity guard
   //  This check come before toPolynomial
   {
     size_t arity = max_constraint_arity(instance);
@@ -261,7 +271,7 @@ static int run(int argc, char** argv) {
     }
   }
 
-  // ---- build the constraint composite graph ------------------------------
+  // build the constraint composite graph
   ccg_t ccg;
   WCSPInstance<>::constraint_t::Polynomial p;
   for (const auto& c : instance.getConstraints()) c.toPolynomial(p);
@@ -294,7 +304,7 @@ static int run(int argc, char** argv) {
   std::cout << "[graph] edges before    : " << boost::num_edges(g) << "\n";
   std::cout << "[stage] simplified out  : " << simplified << "\n";
 
-  // ---- kernelize to a fixed point ---------------------------------------
+  // kernelize to a fixed point
   //  Removing vertices can expose further forced variables, so the kernelizer is re-run until a round resolves nothing new. This mirrors WCSPLift's main.cpp;
   //  earlier harnesses in this project ran a single pass and so under-reported what kernelization achieves
   double kern_time = 0.0;
@@ -323,6 +333,12 @@ static int run(int argc, char** argv) {
 #ifdef HAVE_GUROBI
       else if (kern == "lp") {
         KernelizerLinearProgramming<> k(new LinearProgramSolverGurobi());
+        k.kernelize(g, assignments);
+      }
+#endif
+#ifdef HAVE_CPLEX
+      else if (kern == "cplex") {
+        KernelizerLinearProgramming<> k(new LinearProgramSolverCplex());
         k.kernelize(g, assignments);
       }
 #endif
@@ -360,7 +376,7 @@ static int run(int argc, char** argv) {
   }
   std::cout << "[kernel] vertex reduction: " << vred << " %\n";
 
-  // ---- solve the remnant -------------------------------------------------
+  // solve the remnant
   double solve_time = 0.0;
   double mwvc_weight = 0.0;
   bool solved = false;
@@ -408,7 +424,7 @@ static int run(int argc, char** argv) {
     }
   }
 
-  // ---- final objective ---------------------------------------------------
+  // final objective 
   auto t_all1 = clk::now();
   std::cout << "[e2e] assignments       : " << assignments.size() << "\n";
   if (solved) {
