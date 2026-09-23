@@ -1,15 +1,18 @@
-// Runs BOTH kernelizers on the same CCG built from one .wcsp file, then compares the resulting assignments variable by variable
+// Runs kernelizers on the same CCG built from one .wcsp file and compares the resulting assignments variable by variable
 //
 // Usage:
-//   ./compare_kernels <file.wcsp>              both kernelizers, one process
-//   ./compare_kernels mf  <file.wcsp> <out>    max-flow only, dump assignments
-//   ./compare_kernels lp  <file.wcsp> <out>    Gurobi only, dump assignments
-//   ./compare_kernels cmp <a> <b>              compare two dumps (a=mf, b=lp)
+//   ./compare_kernels <file.wcsp>                 max-flow and Gurobi, one process
+//   ./compare_kernels mf    <file.wcsp> <out>     max-flow only, dump assignments
+//   ./compare_kernels lp    <file.wcsp> <out>     Gurobi LP only, dump assignments
+//   ./compare_kernels cplex <file.wcsp> <out>     CPLEX LP only, dump assignments (needs a -DHAVE_CPLEX build)
+//   ./compare_kernels cmp   <a> <b>               compare any two dumps
 //
 // For anything at 300k or above, prefer the split form:
-//   ./compare_kernels mf data/bench/10_1M.wcsp /tmp/mf.txt
-//   ./compare_kernels lp data/bench/10_1M.wcsp /tmp/lp.txt
-//   ./compare_kernels cmp /tmp/mf.txt /tmp/lp.txt
+//   ./compare_kernels mf    data/bench/10_1M.wcsp /tmp/mf.txt
+//   ./compare_kernels cplex data/bench/10_1M.wcsp /tmp/cplex.txt
+//   ./compare_kernels cmp   /tmp/mf.txt /tmp/cplex.txt
+//
+// Exit code: 0 = done (for cmp: no contradictions), 3 = cmp found OPPOSITE values, 1/2 = usage or file errors
 
 #include <cstdlib>
 #include <cstring>
@@ -20,8 +23,12 @@
 
 #include "third_party/wcsp-solver/src/WCSPInstance.h"
 #include "third_party/wcsp-solver/src/ConstraintCompositeGraph.h"
+#include "third_party/wcsp-solver/src/LinearProgramSolver.h"
 #include "third_party/wcsp-solver/src/KernelizerLinearProgramming.h"
 #include "third_party/wcsp-solver/src/LinearProgramSolverGurobi.h"
+#ifdef HAVE_CPLEX
+#include "third_party/wcsp-solver/src/LinearProgramSolverCplex.h"
+#endif
 #include "src/integration/KernelizerMaxflow.h"
 
 typedef ConstraintCompositeGraph<>::variable_id_t vid_t;
@@ -55,14 +62,15 @@ static void run_maxflow(const char* path, std::map<vid_t, bool>& out) {
   graph_t().swap(g);
 }
 
-//  Run the LP kernelizer and release the CCG before returning.
-static void run_gurobi(const char* path, std::map<vid_t, bool>& out) {
+//  Run an LP kernelizer with the given solver backend and release the CCG before returning.
+//  KernelizerLinearProgramming takes ownership of the solver object.
+static void run_lp(const char* path, std::map<vid_t, bool>& out, LinearProgramSolver* solver) {
   graph_t g;
   std::map<vid_t, bool> pre;
   build(path, g, pre);
   out = pre;
   std::map<vid_t, bool>().swap(pre);
-  KernelizerLinearProgramming<> k(new LinearProgramSolverGurobi());
+  KernelizerLinearProgramming<> k(solver);
   k.kernelize(g, out);
   graph_t().swap(g);
 }
@@ -81,25 +89,32 @@ static void load(const char* path, std::map<vid_t, bool>& m) {
   while (in >> v >> b) m[static_cast<vid_t>(v)] = (b != 0);
 }
 
-static void compare(const std::map<vid_t, bool>& a_mf,
-                    const std::map<vid_t, bool>& a_lp,
-                    const char* label) {
-  size_t only_mf = 0, only_lp = 0, agree = 0, conflict = 0;
-  for (const auto& kv : a_mf) {
-    auto it = a_lp.find(kv.first);
-    if (it == a_lp.end()) { ++only_mf; continue; }
+static std::string base_name(const char* path) {
+  std::string s(path);
+  size_t slash = s.find_last_of('/');
+  return (slash == std::string::npos) ? s : s.substr(slash + 1);
+}
+
+//  Returns the number of variables the two kernels assigned OPPOSITE values
+static size_t compare(const std::map<vid_t, bool>& a, const std::map<vid_t, bool>& b, const std::string& label, const std::string& name_a, const std::string& name_b) {
+  size_t only_a = 0, only_b = 0, agree = 0, conflict = 0;
+  for (const auto& kv : a) {
+    auto it = b.find(kv.first);
+    if (it == b.end()) { ++only_a; continue; }
     if (it->second == kv.second) ++agree; else ++conflict;
   }
-  for (const auto& kv : a_lp)
-    if (a_mf.find(kv.first) == a_mf.end()) ++only_lp;
+  for (const auto& kv : b)
+    if (a.find(kv.first) == a.end()) ++only_b;
 
   std::cout << "=== kernel comparison: " << label << " ===\n";
-  std::cout << "  decided by max-flow      : " << a_mf.size() << "\n";
-  std::cout << "  decided by Gurobi        : " << a_lp.size() << "\n";
-  std::cout << "  decided by max-flow only : " << only_mf  << "\n";
-  std::cout << "  decided by Gurobi only   : " << only_lp  << "\n";
-  std::cout << "  decided by both, SAME    : " << agree    << "\n";
-  std::cout << "  decided by both, OPPOSITE: " << conflict << "\n\n";
+  std::cout << "  A = " << name_a << "\n";
+  std::cout << "  B = " << name_b << "\n";
+  std::cout << "  decided by A             : " << a.size()  << "\n";
+  std::cout << "  decided by B             : " << b.size()  << "\n";
+  std::cout << "  decided by A only        : " << only_a    << "\n";
+  std::cout << "  decided by B only        : " << only_b    << "\n";
+  std::cout << "  decided by both, SAME    : " << agree     << "\n";
+  std::cout << "  decided by both, OPPOSITE: " << conflict  << "\n\n";
   if (conflict == 0)
     std::cout << "  VERDICT: no contradictions. The two kernels differ only in HOW MANY\n"
                  "           variables they decide, never in WHAT they decide. This is the\n"
@@ -107,6 +122,7 @@ static void compare(const std::map<vid_t, bool>& a_mf,
   else
     std::cout << "  VERDICT: *** " << conflict << " variables were assigned OPPOSITE values. ***\n"
                  "           This is not explainable by non-unique optima. Investigate.\n";
+  return conflict;
 }
 
 int main(int argc, char** argv) {
@@ -118,22 +134,34 @@ int main(int argc, char** argv) {
   }
   if (argc >= 4 && std::strcmp(argv[1], "lp") == 0) {
     std::map<vid_t, bool> a;
-    run_gurobi(argv[2], a);
+    run_lp(argv[2], a, new LinearProgramSolverGurobi());
     dump(a, argv[3]);
     return 0;
   }
-  if (argc >= 4 && std::strcmp(argv[1], "cmp") == 0) {
-    std::map<vid_t, bool> a_mf, a_lp;
-    load(argv[2], a_mf);
-    load(argv[3], a_lp);
-    compare(a_mf, a_lp, argv[2]);
+  if (argc >= 4 && std::strcmp(argv[1], "cplex") == 0) {
+#ifdef HAVE_CPLEX
+    std::map<vid_t, bool> a;
+    run_lp(argv[2], a, new LinearProgramSolverCplex());
+    dump(a, argv[3]);
     return 0;
+#else
+    std::cerr << "this binary was built without -DHAVE_CPLEX\n";
+    return 1;
+#endif
+  }
+  if (argc >= 4 && std::strcmp(argv[1], "cmp") == 0) {
+    std::map<vid_t, bool> a, b;
+    load(argv[2], a);
+    load(argv[3], b);
+    const size_t conflict = compare(a, b, base_name(argv[2]) + " vs " + base_name(argv[3]),
+                                    base_name(argv[2]), base_name(argv[3]));
+    return conflict == 0 ? 0 : 3;
   }
 
   if (argc < 2) {
     std::cerr << "usage: " << argv[0] << " <file.wcsp>\n"
-              << "       " << argv[0] << " mf|lp <file.wcsp> <out.txt>\n"
-              << "       " << argv[0] << " cmp <mf.txt> <lp.txt>\n";
+              << "       " << argv[0] << " mf|lp|cplex <file.wcsp> <out.txt>\n"
+              << "       " << argv[0] << " cmp <a.txt> <b.txt>\n";
     return 1;
   }
 
@@ -142,7 +170,7 @@ int main(int argc, char** argv) {
   std::map<vid_t, bool> a_mf, a_lp;
   run_maxflow(argv[1], a_mf);
   std::cerr << "  [max-flow stage done: " << a_mf.size() << " decided]\n";
-  run_gurobi(argv[1], a_lp);
-  compare(a_mf, a_lp, argv[1]);
-  return 0;
+  run_lp(argv[1], a_lp, new LinearProgramSolverGurobi());
+  const size_t conflict = compare(a_mf, a_lp, argv[1], "max-flow", "Gurobi LP");
+  return conflict == 0 ? 0 : 3;
 }
