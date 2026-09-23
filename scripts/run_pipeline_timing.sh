@@ -140,6 +140,7 @@ rep                   repeat number, 1..N (--repeat). Same work each time; the s
 format                dimacs (.wcsp) or uai
 kernelizer            none = THE CONTROL, no kernelization at all
                       lp   = Gurobi's linear-programming kernelizer (the baseline we replace)
+                      cplex = IBM CPLEX's linear-programming kernelizer (second commercial baseline)
                       cpu  = our max-flow kernelizer on the CPU
                       gpu  = our max-flow kernelizer on the GPU
 solver                exact solver run after kernelizing: none | mp (message passing) | ilp (Gurobi)
@@ -235,15 +236,15 @@ while [ "$rep" -le "$REPEAT" ]; do
       if [ "$MEMGB" -gt 0 ]; then
         ( ulimit -v $((MEMGB * 1024 * 1024))
           if [ "$TIMEOUT" -gt 0 ]; then
-            /usr/bin/time -v -o "$res" timeout "$TIMEOUT" "${cmd[@]}" > "$out" 2>&1
+            /usr/bin/time -v -o "$res" timeout -k 60 "$TIMEOUT" "${cmd[@]}" < /dev/null > "$out" 2>&1
           else
-            /usr/bin/time -v -o "$res" "${cmd[@]}" > "$out" 2>&1
+            /usr/bin/time -v -o "$res" "${cmd[@]}" < /dev/null > "$out" 2>&1
           fi )
       else
         if [ "$TIMEOUT" -gt 0 ]; then
-          /usr/bin/time -v -o "$res" timeout "$TIMEOUT" "${cmd[@]}" > "$out" 2>&1
+          /usr/bin/time -v -o "$res" timeout -k 60 "$TIMEOUT" "${cmd[@]}" < /dev/null > "$out" 2>&1
         else
-          /usr/bin/time -v -o "$res" "${cmd[@]}" > "$out" 2>&1
+          /usr/bin/time -v -o "$res" "${cmd[@]}" < /dev/null > "$out" 2>&1
         fi
       fi
       rc=$?
