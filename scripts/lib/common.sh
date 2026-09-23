@@ -21,13 +21,20 @@
 #   raw program output in                                   results/<YYYY-MM-DD>/raw/
 #   benchmark METADATA (censuses, manifests) belongs in     data/artifact/ 
 
-# ---------------------------------------------------------------- init
+# This is a bash library. Sourced from zsh, BASH_SOURCE is empty, so mf_init would cd two folders ABOVE the repo, and zsh would pass
+# "$GRB_SRC" as one filename instead of two. Refuse instead of misbehaving.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "common.sh is a bash library -- run a script (e.g. ./scripts/build.sh) instead of sourcing it in zsh" >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# init
 
 mf_init() {
   local tag="$1"
   REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   cd "$REPO" || exit 1
-  DAY="$(date +%Y-%m-%d)"
+  DAY="${MF_DAY:-$(date +%Y-%m-%d)}"   # MF_DAY pins the folder, so a run crossing midnight stays together
   OUT="results/$DAY"
   RAW="$OUT/raw"
   mkdir -p "$RAW"
@@ -61,7 +68,7 @@ legend_for() {
   cat "$lg"
 }
 
-# ---------------------------------------------------------------- env
+# env
 
 record_env() {
   local f="$1"
@@ -77,6 +84,7 @@ record_env() {
     echo "nvcc            : $(nvcc --version 2>/dev/null | tail -1)"
     echo "gpu             : $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null)"
     echo "gurobi home     : ${GUROBI_HOME:-<unset>}"
+    echo "cplex home      : ${CPLEX_HOME:-<unset>}"
     echo "git branch      : $(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
     echo "git commit      : $(git rev-parse --short HEAD 2>/dev/null)"
     echo "git dirty       : $(git status --porcelain 2>/dev/null | wc -l) file(s)"
@@ -84,7 +92,7 @@ record_env() {
   tee -a "$RUNLOG" < "$f"
 }
 
-# ---------------------------------------------------------------- run + parse
+# run + parse
 
 # timed OUTFILE RESFILE CMD...   honours $TIMEOUT (0 or unset = no limit)
 timed() {
@@ -117,11 +125,12 @@ status_of() {
     5)   echo skip_domain ;;      # non-Boolean or domain-1 variable
     6)   echo skip_arity ;;       # constraint arity above --max-arity
     124) echo timeout ;;
+    137) echo timeout_killed ;;      # still running 60 s after the timeout signal, so it was force-killed
     *)   echo "fail_rc$1" ;;
   esac
 }
 
-# ---------------------------------------------------------------- build
+# build
 
 detect_arch() {
   if [ -n "${ARCH_OVERRIDE:-}" ]; then echo "$ARCH_OVERRIDE"; return; fi
@@ -146,16 +155,32 @@ gurobi_flags() {
   fi
 }
 
+# sets CPX_FLAGS CPX_SRC CPX_LIBS; empty when CPLEX is absent. Call AFTER gurobi_flags:
+# LinearProgramSolver.cpp must be compiled exactly once, so it is added here only when Gurobi did not add it
+cplex_flags() {
+  CPX_FLAGS=""; CPX_SRC=""; CPX_LIBS=""
+  if [ -n "${CPLEX_HOME:-}" ] && [ -f "$CPLEX_HOME/include/ilcplex/cplex.h" ]; then
+    CPX_FLAGS="-DHAVE_CPLEX -I$CPLEX_HOME/include"
+    CPX_SRC="third_party/wcsp-solver/src/LinearProgramSolverCplex.cpp"
+    [ -z "$GRB_SRC" ] && CPX_SRC="third_party/wcsp-solver/src/LinearProgramSolver.cpp $CPX_SRC"
+    CPX_LIBS="-L$CPLEX_HOME/lib/x86-64_linux/static_pic -lcplex -lm -lpthread -ldl"
+    say "cplex           : enabled ($CPLEX_HOME)"
+  else
+    say "cplex           : DISABLED (CPLEX_HOME unset) -- cplex kernelizer unavailable"
+  fi
+}
+
 build_core() {
   say "--- build: core tools ---"
   gurobi_flags
+  cplex_flags
 
   say "compiling mincut_lattice"
   g++ -std=c++17 -O2 -I. apps/mincut_lattice.cpp -o mincut_lattice -lopenblas 2>&1 | tee -a "$RUNLOG"
 
   say "compiling e2e_solve"
   # shellcheck disable=SC2086
-  g++ -std=c++17 -O2 $GRB_FLAGS -I. apps/e2e_solve.cpp $GRB_SRC -o e2e_solve $GRB_LIBS -lopenblas 2>&1 | tee -a "$RUNLOG"
+    g++ -std=c++17 -O2 $GRB_FLAGS $CPX_FLAGS -I. apps/e2e_solve.cpp $GRB_SRC $CPX_SRC -o e2e_solve $GRB_LIBS $CPX_LIBS -lopenblas 2>&1 | tee -a "$RUNLOG"
 
   say "compiling wcsp_collapse"
   g++ -std=c++17 -O2 apps/wcsp_collapse.cpp -o wcsp_collapse 2>&1 | tee -a "$RUNLOG"
@@ -164,7 +189,7 @@ build_core() {
   if [ -n "$arch" ] && command -v nvcc >/dev/null 2>&1; then
     say "compiling e2e_solve_gpu ($arch)"
     # shellcheck disable=SC2086
-    nvcc -x cu -std=c++17 -O2 -arch="$arch" -DUSE_GPU $GRB_FLAGS -I. apps/e2e_solve.cpp $GRB_SRC -o e2e_solve_gpu $GRB_LIBS -lopenblas 2>&1 | tee -a "$RUNLOG"
+        nvcc -x cu -std=c++17 -O2 -arch="$arch" -DUSE_GPU $GRB_FLAGS $CPX_FLAGS -I. apps/e2e_solve.cpp $GRB_SRC $CPX_SRC -o e2e_solve_gpu $GRB_LIBS $CPX_LIBS -lopenblas 2>&1 | tee -a "$RUNLOG"
   else
     say "gpu             : SKIPPED (no nvcc or no device)"
   fi
@@ -174,6 +199,7 @@ build_core() {
 build_gates() {
   say "--- build: correctness gates ---"
   gurobi_flags
+  cplex_flags
   say "compiling kernelizer_maxflow_test"
   g++ -std=c++17 -O2 -I. apps/kernelizer_maxflow_test.cpp -o kmf_test -lopenblas 2>&1 | tee -a "$RUNLOG"
   say "compiling cut_audit"
@@ -181,7 +207,7 @@ build_gates() {
   if [ -n "$GRB_FLAGS" ]; then
     say "compiling compare_kernels"
     # shellcheck disable=SC2086
-    g++ -std=c++17 -O2 $GRB_FLAGS -I. apps/compare_kernels.cpp $GRB_SRC -o compare_kernels $GRB_LIBS -lopenblas 2>&1 | tee -a "$RUNLOG"
+    g++ -std=c++17 -O2 $GRB_FLAGS $CPX_FLAGS -I. apps/compare_kernels.cpp $GRB_SRC $CPX_SRC -o compare_kernels $GRB_LIBS $CPX_LIBS -lopenblas 2>&1 | tee -a "$RUNLOG"
   else
     say "compare_kernels : SKIPPED (needs Gurobi)"
   fi
