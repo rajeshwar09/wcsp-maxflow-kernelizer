@@ -250,7 +250,7 @@ while [ "$rep" -le "$REPEAT" ]; do
       rc=$?
 
       status="$(status_of $rc)"
-      grep -q 'std::bad_alloc\|Cannot allocate' "$out" 2>/dev/null && status=oom
+      grep -qi 'bad_alloc\|cannot allocate\|out of memory' "$out" 2>/dev/null && status=oom
 
       fmt="$(g_field e2e format "$out")"
       rounds="$(g_field kernel rounds "$out")"

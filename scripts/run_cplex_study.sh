@@ -364,7 +364,7 @@ if has probe; then
         guarded "$out" "$res" ./e2e_solve --kernelizer cplex --solver none --max-rounds 1 "$PF"
       local rc=$? st tk bk pg
       st="$(status_of "$rc")"
-      grep -q 'std::bad_alloc\|Cannot allocate' "$out" 2>/dev/null && st=oom
+      grep -qi 'bad_alloc\|cannot allocate\|out of memory' "$out" 2>/dev/null && st=oom
       tk="$(kfield e2e 'kernel time' "$out")";      [ -n "$tk" ] || tk=NA
       bk="$(kfield kernel 'by kernelizer' "$out")"; [ -n "$bk" ] || bk=NA
       pg="$(awk -v k="$(peak_kb "$res")" 'BEGIN { if (k == "") print "NA"; else printf "%.2f", k / 1048576 }')"
