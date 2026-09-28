@@ -147,10 +147,11 @@ say "kernelizers     : $KERNS"
 say "timeout s       : $TIMEOUT"
 say ""
 
-# ------------------------------------------------------------------- lattice
+# lattice
 
 do_lattice() {
   say "--- lattice: set=$SETNAME ---"
+  archive_if_exists "$LATTSV"
   printf 'instance\tn\tcover_nodes\tcover_edges\tW\tmaxflow\tW_minus_F\tall_half\tsame_scc\tsame_pct\tdiff_scc\tdiff_pct\tdecided\tdecided_pct\trecoverable\tverdict\twall_s\tpeak_kb\n' > "$LATTSV"
 
   legend_for "$LATTSV" <<'EOF'
@@ -225,10 +226,11 @@ EOF
   say ""
 }
 
-# ------------------------------------------------------------------- compare
+# compare
 
 do_compare() {
   say "--- compare: set=$SETNAME kernelizers=$KERNS ---"
+  archive_if_exists "$KERNTSV"
   printf 'instance\tkernelizer\ttotal_vars\tvertices_before\tdecided\treduction_pct\trounds\tkern_time_s\twall_s\tpeak_kb\n' > "$KERNTSV"
 
   legend_for "$KERNTSV" <<'EOF'
@@ -289,7 +291,7 @@ EOF
   say ""
 }
 
-# ------------------------------------------------------------------- summary
+# summary
 
 do_summary() {
   {
@@ -317,7 +319,7 @@ do_summary() {
   tee -a "$RUNLOG" < "$SUMMARY"
 }
 
-# ---------------------------------------------------------------------- main
+#--- main
 
 case "$PHASE" in
   build)   [ "$DO_BUILD" = "1" ] && build_core ;;
