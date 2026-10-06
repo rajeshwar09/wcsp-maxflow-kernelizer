@@ -89,6 +89,15 @@ namespace maxflow {
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_frontier_in,       V       * sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_frontier_out,      V       * sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_frontier_count,    1       * sizeof(int)));
+        {   // GPU memory footprint: exactly the cudaMalloc calls above
+            const size_t gpu_bytes =
+                  (size_t)(V + 1) * sizeof(int)                          // d_offset
+                + (size_t)E * (2 * sizeof(int) + 2 * sizeof(cap_t))      // edge_dst, reverse_index, capacity, residual
+                + (size_t)V * (sizeof(cap_t) + 3 * sizeof(int))          // excess, height, frontier_in, frontier_out
+                + 2 * sizeof(int);                                       // flag, frontier_count
+            fprintf(stderr, "[gpu] device memory  : %zu bytes (V=%lld, E=%lld)\n",
+                    gpu_bytes, (long long)V, (long long)E);
+        }
 
         //  Copy graph struct to device
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_offset, net.offset.data(), (V + 1) * sizeof(int), cudaMemcpyHostToDevice));
