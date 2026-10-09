@@ -26,6 +26,7 @@
 #include "src/common/stage_timer.h"
 
 #include "src/gpu/maxflow_gpu_topology.h"
+#include "src/gpu/maxflow_gpu_worklist.h"
 
 namespace maxflow {
 
@@ -167,12 +168,29 @@ namespace maxflow {
         _t = stage_mark("kern.build_flownet", _t);
         
         //  3 : Solve max-flow ON THE GPU
-    
-        //
-        //  gpu_topology_solver exposes the SAME is_on_source_side(v) query as the CPU solver (both defined as height[v] >= num_nodes)
 
-        gpu_topology_solver solver(net);
-        solver.solve();
+        //  Which GPU scheduling strategy to use. Both solvers run the same algorithm and return the same min-cut; they differ only in how many threads they launch per pass
+        //    MAXFLOW_GPU=topology   one thread per VERTEX, every pass (default)
+        //    MAXFLOW_GPU=worklist   one thread per ACTIVE vertex  (paper's O1)
+
+        std::vector<char> source_side(net.num_nodes, 0);
+        {
+          const char* env_gpu = std::getenv("MAXFLOW_GPU");
+          const bool use_worklist = (env_gpu != nullptr && std::string(env_gpu) == "worklist");
+          if (use_worklist) {
+            gpu_worklist_solver solver(net);
+            solver.solve();
+            for (int v = 0; v < net.num_nodes; v++) {
+              source_side[v] = solver.is_on_source_side(v) ? 1 : 0;
+            }
+          } else {
+            gpu_topology_solver solver(net);
+            solver.solve();
+            for (int v = 0; v < net.num_nodes; v++) {
+              source_side[v] = solver.is_on_source_side(v) ? 1 : 0;
+            }
+          }
+        }
 
         _t = stage_mark("kern.maxflow", _t);
 
@@ -187,8 +205,8 @@ namespace maxflow {
         std::vector<int> classification(n, 2);
 
         for (int i = 0; i < n; i++) {
-          bool left_source = solver.is_on_source_side(i + 1);
-          bool right_source = solver.is_on_source_side(n + i + 1);
+          bool left_source = source_side[i + 1] != 0;
+          bool right_source = source_side[n + i + 1] != 0;
 
           if (left_source && !right_source) {
             classification[i] = 0;
