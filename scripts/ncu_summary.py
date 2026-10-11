@@ -33,6 +33,25 @@ def num(s):
         return None
 
 
+TIME_TO_US = {"nsecond": 1e-3, "usecond": 1.0, "msecond": 1e3, "second": 1e6}
+PREFIX = {"K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+
+
+def scale(unit, key):
+    """Factor that turns a value in `unit` into the base unit.
+
+    ncu picks a readable unit per column and per file (e.g. msecond in one file,
+    usecond in another, Ksector instead of sector), so every value is converted:
+    times to microseconds, counts to plain counts.
+    """
+    unit = (unit or "").strip()
+    if key == "time":
+        return TIME_TO_US.get(unit, 1.0)
+    if len(unit) > 1 and unit[0] in PREFIX and unit[1].islower():
+        return PREFIX[unit[0]]
+    return 1.0
+
+
 def main():
     if len(sys.argv) < 4:
         print(__doc__)
@@ -45,14 +64,19 @@ def main():
         # skip any lines before the header (ncu may print ==PROF== notes)
         h = next(i for i, r in enumerate(rows) if "Kernel Name" in r)
         head = rows[h]
-        data = rows[h + 2:]  # row h+1 holds the units
+        units = rows[h + 1]   # row h+1 holds the units of each column
+        data = rows[h + 2:]
         col = {k: head.index(v) for k, v in M.items() if v in head}
+        fac = {k: scale(units[i] if i < len(units) else "", k) for k, i in col.items()}
         kcol = head.index("Kernel Name")
         for r in data:
             if len(r) <= kcol:
                 continue
             name = r[kcol].split("(")[0].replace("maxflow::", "").strip()
-            vals = {k: num(r[i]) for k, i in col.items()}
+            vals = {}
+            for k, i in col.items():
+                v = num(r[i]) if i < len(r) else None
+                vals[k] = v * fac[k] if v is not None else None
             per.setdefault(name, []).append(vals)
 
     new = not os.path.exists(out)
@@ -60,6 +84,7 @@ def main():
         if new:
             fo.write("\t".join(["instance", "kernel", "launches_sampled", "avg_time_us", "grid_blocks",
                                 "block_threads", "sectors_per_request", "active_threads_per_warp",
+                                "sectors_per_active_thread",
                                 "achieved_occupancy_pct", "sm_active_pct", "dram_throughput_pct",
                                 "sm_throughput_pct"]) + "\n")
         for name, lst in sorted(per.items()):
@@ -75,8 +100,10 @@ def main():
             spr = ratio("sect", "req")
             sma = ratio("sm_act", "sm_el")
             cells = [inst, name, len(lst),
-                     t / 1000 if t is not None else None,  # ns -> us
-                     avg("grid"), avg("block"), spr, avg("thr"), avg("occ"),
+                     t,  # already in microseconds
+                     avg("grid"), avg("block"), spr, avg("thr"),
+                     spr / avg("thr") if spr is not None and avg("thr") else None,
+                     avg("occ"),
                      100 * sma if sma is not None else None, avg("dram"), avg("smthr")]
             fmt = []
             for c in cells:
@@ -88,7 +115,7 @@ def main():
                     fmt.append(str(c))
             fo.write("\t".join(fmt) + "\n")
             print("  " + "  ".join(f"{h}={v}" for h, v in zip(
-                ["kernel", "n", "us", "grid", "block", "sect/req", "thr/warp", "occ%", "sm_active%", "dram%", "sm%"],
+                ["kernel", "n", "us", "grid", "block", "sect/req", "thr/warp", "sect/thread", "occ%", "sm_active%", "dram%", "sm%"],
                 fmt[1:])))
 
 

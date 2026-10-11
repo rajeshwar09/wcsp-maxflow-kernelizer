@@ -83,6 +83,8 @@ ncu_summary.tsv  one row per instance and kernel, averaged over the sampled laun
                            8-byte (double) loads need 8; 32 means every thread hit a different sector
   active_threads_per_warp  of the 32 threads in a warp, how many did useful work on average
                            (32 = perfect; low = idle or diverged threads)
+  sectors_per_active_thread  sectors_per_request / active_threads_per_warp; 0.125 (4-byte) to
+                           0.25 (8-byte) when coalesced, about 1 when every thread reads its own sector
   achieved_occupancy_pct   warps resident on an SM as a share of the maximum the SM can hold
   sm_active_pct            share of the kernel's time the average SM had any work at all
   dram_throughput_pct      memory bandwidth used, as a share of the GPU's peak
