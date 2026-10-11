@@ -154,7 +154,7 @@ namespace maxflow {
         }
 
         //  Passes between global relabels. Same meaning and same default as in the topology solver
-        int gr_period = 100;
+        int gr_period = 400;
         {
           const char* env_gr = std::getenv("MAXFLOW_GR_PERIOD");
           if (env_gr != nullptr && std::atoi(env_gr) > 0) {
