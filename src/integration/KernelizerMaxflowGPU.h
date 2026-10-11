@@ -170,13 +170,13 @@ namespace maxflow {
         //  3 : Solve max-flow ON THE GPU
 
         //  Which GPU scheduling strategy to use. Both solvers run the same algorithm and return the same min-cut; they differ only in how many threads they launch per pass
-        //    MAXFLOW_GPU=topology   one thread per VERTEX, every pass (default)
-        //    MAXFLOW_GPU=worklist   one thread per ACTIVE vertex  (paper's O1)
+        //    MAXFLOW_GPU=worklist   one thread per ACTIVE vertex ( default)
+        //    MAXFLOW_GPU=topology   one thread per VERTEX, every pass
 
         std::vector<char> source_side(net.num_nodes, 0);
         {
           const char* env_gpu = std::getenv("MAXFLOW_GPU");
-          const bool use_worklist = (env_gpu != nullptr && std::string(env_gpu) == "worklist");
+          const bool use_worklist = !(env_gpu != nullptr && std::string(env_gpu) == "topology");
           if (use_worklist) {
             gpu_worklist_solver solver(net);
             solver.solve();
