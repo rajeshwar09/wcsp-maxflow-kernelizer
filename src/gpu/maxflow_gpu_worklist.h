@@ -202,6 +202,30 @@ namespace maxflow {
         //  Total threads actually launched, so the saving over the topology-driven solver can be quoted as a number
         long long threads_push = 0, threads_remove = 0;
         std::vector<int> active_history;
+        //  Diagnostics: how evenly the work is spread over the threads (profile build only)
+        double t_bfs_level0 = 0;
+        long long wl_passes = 0, wl_sum_size = 0, wl_max_size = 0;
+        long long wl_sum_edges = 0, wl_sum_maxdeg = 0, wl_max_maxdeg = 0, wl_hub_passes = 0;
+        std::vector<int> h_wl;
+        auto deg = [&](int v) { return (long long)(net.offset[v + 1] - net.offset[v]); };
+        long long max_deg = 0;
+        int max_deg_v = -1, n_deg64 = 0, n_deg1024 = 0;
+        for (int v = 0; v < V; v++) {
+          if (v == net.source || v == net.sink) {
+            continue;
+          }
+          long long d = deg(v);
+          if (d > max_deg) {
+            max_deg = d;
+            max_deg_v = v;
+          }
+          if (d >= 64) {
+            n_deg64++;
+          }
+          if (d >= 1024) {
+            n_deg1024++;
+          }
+        }
         auto clk = []() { return std::chrono::high_resolution_clock::now(); };
         auto secs = [](std::chrono::high_resolution_clock::time_point a, std::chrono::high_resolution_clock::time_point b) {
           return std::chrono::duration<double>(b - a).count();
@@ -259,6 +283,9 @@ namespace maxflow {
                 MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 #ifdef MAXFLOW_PROFILE
                 t_bfs_kernel += secs(tk0, clk());
+                if (level == 0) {
+                  t_bfs_level0 += secs(tk0, clk());
+                }
                 auto tm0 = clk();
 #endif
                 MAXFLOW_CUDA_CHECK(cudaMemcpy(&bfs_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
@@ -286,6 +313,9 @@ namespace maxflow {
                 MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 #ifdef MAXFLOW_PROFILE
                 t_bfs_kernel += secs(tk0, clk());
+                if (level == 0) {
+                  t_bfs_level0 += secs(tk0, clk());
+                }
                 auto tm0 = clk();
 #endif
                 MAXFLOW_CUDA_CHECK(cudaMemcpy(&frontier_size, d_frontier_count, sizeof(int), cudaMemcpyDeviceToHost));
@@ -314,6 +344,32 @@ namespace maxflow {
           if (work_size > 0) {
             //  Algorithm 2: one thread per ACTIVE vertex
 #ifdef MAXFLOW_PROFILE
+            {
+              //  Copy this pass's worklist to the host and measure it; done before the timer starts
+              h_wl.resize(work_size);
+              MAXFLOW_CUDA_CHECK(cudaMemcpy(h_wl.data(), d_worklist, work_size * sizeof(int), cudaMemcpyDeviceToHost));
+              long long sum_d = 0, max_d = 0;
+              for (int i = 0; i < work_size; i++) {
+                long long d = deg(h_wl[i]);
+                sum_d += d;
+                if (d > max_d) {
+                  max_d = d;
+                }
+              }
+              wl_passes++;
+              wl_sum_size += work_size;
+              if (work_size > wl_max_size) {
+                wl_max_size = work_size;
+              }
+              wl_sum_edges += sum_d;
+              wl_sum_maxdeg += max_d;
+              if (max_d > wl_max_maxdeg) {
+                wl_max_maxdeg = max_d;
+              }
+              if (max_d >= 1024) {
+                wl_hub_passes++;
+              }
+            }
             auto tp0 = clk();
             threads_push += work_size;
 #endif
@@ -369,6 +425,25 @@ namespace maxflow {
           std::fprintf(stderr, "  push-relabel  : %8.3f s  (%5.1f%%)\n", t_push, 100.0 * t_push / tot);
           std::fprintf(stderr, "  remove-invalid: %8.3f s  (%5.1f%%)\n", t_remove, 100.0 * t_remove / tot);
           std::fprintf(stderr, "  measured total: %8.3f s\n", tot);
+          {
+            double avg_size  = wl_passes > 0 ? (double)wl_sum_size / wl_passes : 0.0;
+            double avg_edges = wl_passes > 0 ? (double)wl_sum_edges / wl_passes : 0.0;
+            double avg_maxd  = wl_passes > 0 ? (double)wl_sum_maxdeg / wl_passes : 0.0;
+            double avg_per_thread = avg_size > 0 ? avg_edges / avg_size : 0.0;
+            double imbalance = avg_per_thread > 0 ? avg_maxd / avg_per_thread : 0.0;
+            double l0_share = t_bfs_kernel > 0 ? 100.0 * t_bfs_level0 / t_bfs_kernel : 0.0;
+            std::fprintf(stderr, "  BFS level 0 only : %8.3f s  (%5.1f%% of BFS kernel time)\n", t_bfs_level0, l0_share);
+            std::fprintf(stderr, "  degree           : sink %lld  source %lld  largest other %lld (vertex %d)  vertices with >=64 edges %d, >=1024 edges %d\n",
+                         deg(net.sink), deg(net.source), max_deg, max_deg_v, n_deg64, n_deg1024);
+            std::fprintf(stderr, "  worklist per pass: average %.1f vertices, largest %lld\n", avg_size, wl_max_size);
+            std::fprintf(stderr, "  edges per pass   : total %.1f, per thread %.1f, longest thread %.1f (worst %lld)\n",
+                         avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg);
+            std::fprintf(stderr, "  imbalance        : longest thread does %.1fx the average; passes with a >=1024-edge thread: %lld of %lld\n",
+                         imbalance, wl_hub_passes, wl_passes);
+            std::fprintf(stderr, "[diag] V=%d E=%d sink_deg=%lld max_deg=%lld n_deg64=%d n_deg1024=%d relabels=%ld bfs_levels=%ld bfs_kernel_s=%.6f bfs_l0_s=%.6f passes=%lld avg_wl=%.1f max_wl=%lld avg_edges=%.1f avg_per_thread=%.2f avg_longest=%.1f worst_longest=%lld imbalance=%.1f hub_passes=%lld\n",
+                         V, E, deg(net.sink), max_deg, n_deg64, n_deg1024, n_relabels, n_bfs_levels, t_bfs_kernel, t_bfs_level0,
+                         wl_passes, avg_size, wl_max_size, avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg, imbalance, wl_hub_passes);
+          }
           std::fprintf(stderr, "  threads launched, push-relabel  : %lld\n", threads_push);
           std::fprintf(stderr, "  threads launched, remove-invalid: %lld\n", threads_remove);
           std::fprintf(stderr, "  topology-driven would have launched, each: %lld\n", (long long)n_outer * (long long)V);

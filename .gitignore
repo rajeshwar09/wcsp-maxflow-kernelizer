@@ -59,3 +59,4 @@ log/
 /kmf_test
 /e2e_gurobi
 e2e_solve_gpu_prof
+e2e_solve_gpu_diag
