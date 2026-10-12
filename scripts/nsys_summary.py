@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+usage: nsys_summary.py SQLITE|- INSTANCE CCG PLAIN_KERN_S PLAIN_MAXFLOW_S PLAIN_RES PROF_RES SUMMARY_TSV KERNELS_TSV
+
+With "-" instead of a SQLITE file (nsys produced no trace), only the plain run's numbers
+are written, with resolved_match = no_trace and NA in every trace column.
+
 Reads the GPU activity tables of the exported trace and appends
   one row per kernel name to KERNELS_TSV
   one row for the instance to SUMMARY_TSV
@@ -8,6 +13,16 @@ A header is written when a file does not exist yet.
 import os
 import sqlite3
 import sys
+
+
+KER_HEADER = ["instance", "kernel", "step", "launches", "total_ms", "avg_us", "max_us",
+              "pct_kernel_time", "pct_gpu_window"]
+SUM_HEADER = ["instance", "ccg_vertices", "plain_kern_s", "plain_maxflow_s", "plain_resolved",
+              "prof_resolved", "resolved_match", "gpu_window_s", "gpu_busy_s", "gpu_idle_pct",
+              "kernel_s", "kernel_launches", "pct_global_relabel", "pct_push_relabel",
+              "pct_remove_invalid", "pct_build_worklist", "pct_other", "top_kernel",
+              "htod_ms", "dtoh_ms", "dtoh_count", "sync_api_s", "sync_calls",
+              "memcpy_api_s", "launch_api_s"]
 
 
 def table_exists(db, name):
@@ -63,6 +78,16 @@ def main():
         print(__doc__)
         sys.exit(2)
     sqlite_path, inst, ccg, plain_kern, plain_mf, plain_res, prof_res, sum_tsv, ker_tsv = sys.argv[1:10]
+
+    if sqlite_path == "-":
+        # nsys could not produce a trace for this instance: keep the plain run's numbers,
+        # mark every trace column NA, and write no kernel rows
+        row = [inst, ccg, plain_kern, plain_mf, plain_res, prof_res, "no_trace"]
+        row += ["NA"] * (len(SUM_HEADER) - len(row))
+        append(sum_tsv, SUM_HEADER, row)
+        print(f"  no trace: plain run kept (time {plain_kern} s, resolved {plain_res})")
+        return
+
     db = sqlite3.connect(sqlite_path)
 
     kern = rows(db, """SELECT s.value, k.start, k.end
@@ -119,19 +144,11 @@ def main():
 
     for name in sorted(per, key=lambda n: -per[n][0]):
         t = per[name]
-        append(ker_tsv,
-               ["instance", "kernel", "step", "launches", "total_ms", "avg_us", "max_us",
-                "pct_kernel_time", "pct_gpu_window"],
+        append(ker_tsv, KER_HEADER,
                [inst, name, group(name), t[1], f"{t[0] / 1e6:.3f}", f"{t[0] / t[1] / 1e3:.2f}",
                 f"{t[2] / 1e3:.2f}", f"{100.0 * t[0] / kern_ns:.1f}", f"{100.0 * t[0] / window_ns:.1f}"])
 
-    append(sum_tsv,
-           ["instance", "ccg_vertices", "plain_kern_s", "plain_maxflow_s", "plain_resolved",
-            "prof_resolved", "resolved_match", "gpu_window_s", "gpu_busy_s", "gpu_idle_pct",
-            "kernel_s", "kernel_launches", "pct_global_relabel", "pct_push_relabel",
-            "pct_remove_invalid", "pct_build_worklist", "pct_other", "top_kernel",
-            "htod_ms", "dtoh_ms", "dtoh_count", "sync_api_s", "sync_calls",
-            "memcpy_api_s", "launch_api_s"],
+    append(sum_tsv, SUM_HEADER,
            [inst, ccg, plain_kern, plain_mf, plain_res, prof_res, match,
             f"{window_ns / 1e9:.3f}", f"{busy_ns / 1e9:.3f}", f"{idle_pct:.1f}",
             f"{kern_ns / 1e9:.3f}", launches,

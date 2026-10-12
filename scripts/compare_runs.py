@@ -36,6 +36,18 @@ def load_gurobi(paths):
     return g
 
 
+def num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def pr_pct(r):
+    a, b = num(r.get("pct_push_relabel")), num(r.get("pct_remove_invalid"))
+    return f"{a + b:.1f}" if a is not None and b is not None else "NA"
+
+
 def f(v, d=2):
     return "NA" if v is None else f"{v:.{d}f}"
 
@@ -57,7 +69,9 @@ def main():
             continue
         n = new[k]
         tb, tn = float(b["plain_kern_s"]), float(n["plain_kern_s"])
-        same = b["plain_resolved"] == n["plain_resolved"] and n["resolved_match"] == "yes"
+        # no_trace = nsys failed but the plain run is valid (see scripts/nsys_summary.py)
+        same = (b["plain_resolved"] == n["plain_resolved"]
+                and b["resolved_match"] in ("yes", "no_trace") and n["resolved_match"] in ("yes", "no_trace"))
         if not same:
             bad.append(f"{k}: base {b['plain_resolved']}  new {n['plain_resolved']} (profiled {n['prof_resolved']})")
         g = gur.get(k)
@@ -69,9 +83,8 @@ def main():
             "gurobi_s": g,
             "vs_gurobi_base": g / tb if g else None, "vs_gurobi_new": g / tn if g else None,
             "relabel_pct_base": b["pct_global_relabel"], "relabel_pct_new": n["pct_global_relabel"],
-            "pushrem_pct_base": f"{float(b['pct_push_relabel']) + float(b['pct_remove_invalid']):.1f}",
-            "pushrem_pct_new": f"{float(n['pct_push_relabel']) + float(n['pct_remove_invalid']):.1f}",
-            "kernel_s_base": float(b["kernel_s"]), "kernel_s_new": float(n["kernel_s"]),
+            "pushrem_pct_base": pr_pct(b), "pushrem_pct_new": pr_pct(n),
+            "kernel_s_base": num(b["kernel_s"]), "kernel_s_new": num(n["kernel_s"]),
         })
 
     cols = ["instance", "ccg_vertices", "base_s", "new_s", "speedup", "resolved_base", "resolved_new",

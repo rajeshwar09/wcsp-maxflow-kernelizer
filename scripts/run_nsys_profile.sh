@@ -74,7 +74,9 @@ while IFS= read -r inst; do
   fi
   rm -f "$RAW/$name.qdstrm"
   if [ ! -f "$RAW/$name.nsys-rep" ]; then
-    echo "  no report produced, see $RAW/$name.nsys.txt" | tee -a "$LOG"
+    echo "  no report produced, see $RAW/$name.nsys.txt (plain run kept, trace columns NA)" | tee -a "$LOG"
+    python3 scripts/nsys_summary.py - "$name" "${ccg:-NA}" "${p_time:-NA}" "${p_mf:-NA}" \
+      "${p_res:-NA}" NA "$SUM" "$KER" 2>&1 | tee -a "$LOG"
     continue
   fi
   nsys export --type=sqlite --force-overwrite=true -o "$RAW/$name.sqlite" "$RAW/$name.nsys-rep" \
@@ -94,7 +96,8 @@ nsys_summary.tsv  one row per instance, GPU kernelizer, one kernelization round,
   plain_maxflow_s     max-flow stage of the plain run (kern.maxflow)
   plain_resolved      variables decided in the plain run
   prof_resolved       variables decided in the profiled run
-  resolved_match      yes when both runs decided the same count (profiler changed nothing)
+  resolved_match      yes when both runs decided the same count (profiler changed nothing);
+                      no_trace when nsys could not produce a trace (plain_* columns are still valid)
   gpu_window_s        first to last GPU activity in the trace
   gpu_busy_s          time the GPU was running a kernel, copy or memset
   gpu_idle_pct        share of the window the GPU sat idle waiting for the CPU
