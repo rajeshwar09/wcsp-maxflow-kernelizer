@@ -3,6 +3,7 @@
 
 #include "src/gpu/maxflow_gpu_common.h"
 
+#include <climits>
 #include <cstdlib>
 #include <string>
 
@@ -22,14 +23,22 @@ namespace maxflow {
   // Build worklist of active vertices
   // Active = not source, not sink ,positive excess, height below |V|
   // replaces gpu_check_active_kernel: worklist size is the active count
-  __global__ void wl_build_worklist_kernel(int num_nodes, int source, int sink, const cap_t* excess, const int* height, int* worklist, int* count) {
+  //
+  // Fix B: active vertices with hub_deg or more edges go to a second list (hub_list) and are later processed by a whole warp each; all others go to worklist as before
+  // counts[0] = size of worklist, counts[1] = size of hub_list. hub_deg = 0 puts every vertex in worklist, which is exactly the old behaviour
+  __global__ void wl_build_worklist_kernel(int num_nodes, int source, int sink, int hub_deg, const int* offset, const cap_t* excess, const int* height, int* worklist, int* hub_list, int* counts) {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     if (u >= num_nodes || u == source || u == sink) {
       return;
     }
     if (excess[u] > MAXFLOW_EPSILON && height[u] < num_nodes) {
-      int pos = atomicAdd(count, 1);
-      worklist[pos] = u;
+      if (hub_deg > 0 && offset[u + 1] - offset[u] >= hub_deg) {
+        int pos = atomicAdd(&counts[1], 1);
+        hub_list[pos] = u;
+      } else {
+        int pos = atomicAdd(&counts[0], 1);
+        worklist[pos] = u;
+      }
     }
   }
 
@@ -98,6 +107,103 @@ namespace maxflow {
     }
   }
 
+  // Fix B: algorithm 2 for hub vertices, ONE WARP per hub vertex
+  //
+  // Same rule as wl_push_relabel_kernel. The only difference is how the lowest neighbour is found: the 32 lanes of the warp share the edge list (lane l reads edges l, l+32, l+64, ...),
+  // so neighbouring lanes read neighbouring edges (coalesced loads), then a warp reduction picks the lowest (height, edge) pair. Ties go to the smaller edge index, which is the edge the
+  // single-thread loop would pick. Lane 0 then does the push or relabel exactly as before
+  __global__ void wl_push_relabel_hub_kernel(int hub_size, int num_nodes, int kernel_cycles, const int* hub_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height) {
+    const unsigned FULL = 0xffffffffu;
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x & 31;
+    if (warp >= hub_size) {
+      return; // the whole warp leaves together: all 32 lanes have the same warp number
+    }
+    int u = hub_list[warp];
+    int start = offset[u];
+    int end = offset[u + 1];
+
+    for (int cnt = 0; cnt < kernel_cycles; cnt++) {
+      int active = 0;
+      if (lane == 0) {
+        active = (height[u] < num_nodes && excess[u] > MAXFLOW_EPSILON) ? 1 : 0;
+      }
+      active = __shfl_sync(FULL, active, 0);
+      if (!active) {
+        break; // u not active
+      }
+
+      // each lane: lowest-height residual neighbour among its own edges
+      int best_h = num_nodes + 1;
+      int best_e = INT_MAX;
+      for (int e = start + lane; e < end; e += 32) {
+        if (residual_capacity[e] > MAXFLOW_EPSILON) {
+          int h = height[edge_dst[e]];
+          if (h < best_h) {
+            best_h = h;
+            best_e = e;
+          }
+        }
+      }
+
+      // warp reduction: lowest height, ties to the smaller edge index
+      for (int off = 16; off > 0; off >>= 1) {
+        int oh = __shfl_down_sync(FULL, best_h, off);
+        int oe = __shfl_down_sync(FULL, best_e, off);
+        if (oh < best_h || (oh == best_h && oe < best_e)) {
+          best_h = oh;
+          best_e = oe;
+        }
+      }
+
+      int stop = 0;
+      if (lane == 0) {
+        if (best_h > num_nodes) {
+          stop = 1; // no residual edge
+        } else if (height[u] > best_h) {
+          // push min(excess[u], residual[best_e]) along best_e
+          int v_hat = edge_dst[best_e];
+          cap_t a = excess[u];
+          cap_t b = residual_capacity[best_e];
+          cap_t d = (a < b) ? a : b;
+          atomicAdd(&residual_capacity[best_e], -d);
+          atomicAdd(&residual_capacity[reverse_index[best_e]], d);
+          atomicAdd(&excess[u], -d);
+          atomicAdd(&excess[v_hat], d);
+        } else {
+          // relabel - raise u just above its lowest neighbour
+          height[u] = best_h + 1;
+        }
+      }
+      __syncwarp(); // lane 0's updates are visible to the whole warp before the next round
+      stop = __shfl_sync(FULL, stop, 0);
+      if (stop) {
+        break;
+      }
+    }
+  }
+
+  // Fix B: algorithm 3 for hub vertices, ONE WARP per hub vertex. Same rule as wl_remove_invalid_edges_kernel; the lanes simply share the edge list
+  __global__ void wl_remove_invalid_hub_kernel(int hub_size, const int* hub_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height) {
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x & 31;
+    if (warp >= hub_size) {
+      return;
+    }
+    int u = hub_list[warp];
+    int hu = height[u]; // this kernel never changes heights
+    for (int e = offset[u] + lane; e < offset[u + 1]; e += 32) {
+      int v = edge_dst[e];
+      cap_t rc = residual_capacity[e];
+      if (rc > MAXFLOW_EPSILON && hu > height[v] + 1) {
+        residual_capacity[e] = cap_t(0);
+        atomicAdd(&residual_capacity[reverse_index[e]], rc);
+        atomicAdd(&excess[u], -rc);
+        atomicAdd(&excess[v], rc);
+      }
+    }
+  }
+
   // host solver
   class gpu_worklist_solver {
     public:
@@ -115,7 +221,8 @@ namespace maxflow {
 
         //  The worklist can never hold more than V entries -vertex is appended at most once per build, and source and sink are not appended
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_worklist,          V       * sizeof(int)));
-        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_worklist_count,    1       * sizeof(int)));
+        //  counts[0] = worklist size, counts[1] = hub list size (Fix B)
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_counts,            2       * sizeof(int)));
 
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_frontier_in,       V       * sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_frontier_out,      V       * sizeof(int)));
@@ -131,7 +238,7 @@ namespace maxflow {
         cudaFree(d_offset); cudaFree(d_edge_dst); cudaFree(d_capacity);
         cudaFree(d_residual_capacity); cudaFree(d_reverse_index);
         cudaFree(d_excess); cudaFree(d_height); cudaFree(d_flag);
-        cudaFree(d_worklist); cudaFree(d_worklist_count);
+        cudaFree(d_worklist); cudaFree(d_counts); cudaFree(d_hub_list);
         cudaFree(d_frontier_in); cudaFree(d_frontier_out); cudaFree(d_frontier_count);
       }
 
@@ -213,6 +320,46 @@ namespace maxflow {
           sink_level_parallel = false;
         }
 
+        //  Fix B: vertices with at least hub_deg edges are processed by a whole warp in push-relabel and remove-invalid. Default 64; MAXFLOW_HUB_DEG=0 turns Fix B off (every vertex gets one thread, the old behaviour)
+        int hub_deg = 64;
+        {
+          const char* env_hub = std::getenv("MAXFLOW_HUB_DEG");
+          if (env_hub != nullptr) {
+            hub_deg = std::max(0, std::atoi(env_hub));
+          }
+        }
+        //  The hub list can hold at most the vertices that have hub_deg or more edges
+        int hub_capacity = 0;
+        if (hub_deg > 0) {
+          for (int v = 0; v < V; v++) {
+            if (v != net.source && v != net.sink && net.offset[v + 1] - net.offset[v] >= hub_deg) {
+              hub_capacity++;
+            }
+          }
+        }
+        if (hub_capacity == 0) {
+          hub_deg = 0; // no vertex is big enough: nothing to split
+        }
+        if (d_hub_list != nullptr) {
+          cudaFree(d_hub_list);
+          d_hub_list = nullptr;
+        }
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_hub_list, std::max(1, hub_capacity) * sizeof(int)));
+
+        int small_size = 0;  // vertices in d_worklist, one thread each
+        int hub_size = 0;    // vertices in d_hub_list, one warp each
+        int work_size = 0;   // all active vertices = small_size + hub_size
+        auto build_lists = [&]() {
+          MAXFLOW_CUDA_CHECK(cudaMemset(d_counts, 0, 2 * sizeof(int)));
+          wl_build_worklist_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, hub_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_counts);
+          MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+          int h_counts[2];
+          MAXFLOW_CUDA_CHECK(cudaMemcpy(h_counts, d_counts, 2 * sizeof(int), cudaMemcpyDeviceToHost));
+          small_size = h_counts[0];
+          hub_size = h_counts[1];
+          work_size = small_size + hub_size;
+        };
+
 #ifdef MAXFLOW_PROFILE
         double t_worklist = 0, t_bfs = 0, t_push = 0, t_remove = 0;
         double t_bfs_kernel = 0, t_bfs_copy = 0;
@@ -224,7 +371,8 @@ namespace maxflow {
         double t_bfs_level0 = 0;
         long long wl_passes = 0, wl_sum_size = 0, wl_max_size = 0;
         long long wl_sum_edges = 0, wl_sum_maxdeg = 0, wl_max_maxdeg = 0, wl_hub_passes = 0;
-        std::vector<int> h_wl;
+        long long wl_sum_threads = 0, wl_sum_hubs = 0;
+        std::vector<int> h_wl, h_hub;
         auto deg = [&](int v) { return (long long)(net.offset[v + 1] - net.offset[v]); };
         long long max_deg = 0;
         int max_deg_v = -1, n_deg64 = 0, n_deg1024 = 0;
@@ -252,18 +400,13 @@ namespace maxflow {
 
         int outer_iter = 0;
         bool heights_fresh = false;
-        int work_size = 0;
 
         while (true) {
           //  Build the worklist. Its size doubles as the termination test, so no separate check-active pass is needed
 #ifdef MAXFLOW_PROFILE
           auto tw0 = clk();
 #endif
-          int zero = 0;
-          MAXFLOW_CUDA_CHECK(cudaMemcpy(d_worklist_count, &zero, sizeof(int), cudaMemcpyHostToDevice));
-          wl_build_worklist_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_excess, d_height, d_worklist, d_worklist_count);
-          MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-          MAXFLOW_CUDA_CHECK(cudaMemcpy(&work_size, d_worklist_count, sizeof(int), cudaMemcpyDeviceToHost));
+          build_lists();
 #ifdef MAXFLOW_PROFILE
           t_worklist += secs(tw0, clk());
           active_history.push_back(work_size);
@@ -360,29 +503,42 @@ namespace maxflow {
 
           //  A global relabel can remove every remaining active vertex. Rebuild so the push pass does not launch threads for vertices that are now inactive
           if (do_global_relabel && work_size > 0) {
-            int zero2 = 0;
-            MAXFLOW_CUDA_CHECK(cudaMemcpy(d_worklist_count, &zero2, sizeof(int), cudaMemcpyHostToDevice));
-            wl_build_worklist_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_excess, d_height, d_worklist, d_worklist_count);
-            MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-            MAXFLOW_CUDA_CHECK(cudaMemcpy(&work_size, d_worklist_count, sizeof(int), cudaMemcpyDeviceToHost));
+            build_lists();
           }
 
           if (work_size > 0) {
             //  Algorithm 2: one thread per ACTIVE vertex
 #ifdef MAXFLOW_PROFILE
             {
-              //  Copy this pass's worklist to the host and measure it; done before the timer starts
-              h_wl.resize(work_size);
-              MAXFLOW_CUDA_CHECK(cudaMemcpy(h_wl.data(), d_worklist, work_size * sizeof(int), cudaMemcpyDeviceToHost));
+              //  Copy this pass's lists to the host and measure them; done before the timer starts.
+              //  max_d = edges scanned by the busiest GPU thread: a small vertex's whole edge list,
+              //  or ceil(deg/32) for a hub, whose edges are shared by the 32 lanes of a warp
+              h_wl.resize(small_size);
+              h_hub.resize(hub_size);
+              if (small_size > 0) {
+                MAXFLOW_CUDA_CHECK(cudaMemcpy(h_wl.data(), d_worklist, small_size * sizeof(int), cudaMemcpyDeviceToHost));
+              }
+              if (hub_size > 0) {
+                MAXFLOW_CUDA_CHECK(cudaMemcpy(h_hub.data(), d_hub_list, hub_size * sizeof(int), cudaMemcpyDeviceToHost));
+              }
               long long sum_d = 0, max_d = 0;
-              for (int i = 0; i < work_size; i++) {
+              for (int i = 0; i < small_size; i++) {
                 long long d = deg(h_wl[i]);
                 sum_d += d;
                 if (d > max_d) {
                   max_d = d;
                 }
               }
+              for (int i = 0; i < hub_size; i++) {
+                long long d = deg(h_hub[i]);
+                sum_d += d;
+                if ((d + 31) / 32 > max_d) {
+                  max_d = (d + 31) / 32;
+                }
+              }
               wl_passes++;
+              wl_sum_threads += (long long)small_size + 32LL * hub_size;
+              wl_sum_hubs += hub_size;
               wl_sum_size += work_size;
               if (work_size > wl_max_size) {
                 wl_max_size = work_size;
@@ -399,19 +555,21 @@ namespace maxflow {
             auto tp0 = clk();
             threads_push += work_size;
 #endif
-            int blocks_w = (work_size + threads - 1) / threads;
-            wl_push_relabel_kernel<<<blocks_w, threads>>>(work_size, V, kernel_cycles, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+            if (small_size > 0) {
+              int blocks_w = (small_size + threads - 1) / threads;
+              wl_push_relabel_kernel<<<blocks_w, threads>>>(small_size, V, kernel_cycles, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+            }
+            if (hub_size > 0) {
+              int blocks_h = (hub_size * 32 + threads - 1) / threads;  // one warp per hub
+              wl_push_relabel_hub_kernel<<<blocks_h, threads>>>(hub_size, V, kernel_cycles, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+            }
             MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 #ifdef MAXFLOW_PROFILE
             t_push += secs(tp0, clk());
 #endif
 
             if (rebuild_before_remove) {
-              int zero3 = 0;
-              MAXFLOW_CUDA_CHECK(cudaMemcpy(d_worklist_count, &zero3, sizeof(int), cudaMemcpyHostToDevice));
-              wl_build_worklist_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, d_excess, d_height, d_worklist, d_worklist_count);
-              MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-              MAXFLOW_CUDA_CHECK(cudaMemcpy(&work_size, d_worklist_count, sizeof(int), cudaMemcpyDeviceToHost));
+              build_lists();
             }
 
             //  Algorithm 3: one thread per worklist entry
@@ -420,8 +578,14 @@ namespace maxflow {
               auto tr0 = clk();
               threads_remove += work_size;
 #endif
-              int blocks_r = (work_size + threads - 1) / threads;
-              wl_remove_invalid_edges_kernel<<<blocks_r, threads>>>(work_size, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+              if (small_size > 0) {
+                int blocks_r = (small_size + threads - 1) / threads;
+                wl_remove_invalid_edges_kernel<<<blocks_r, threads>>>(small_size, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+              }
+              if (hub_size > 0) {
+                int blocks_h = (hub_size * 32 + threads - 1) / threads;  // one warp per hub
+                wl_remove_invalid_hub_kernel<<<blocks_h, threads>>>(hub_size, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+              }
               MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 #ifdef MAXFLOW_PROFILE
               t_remove += secs(tr0, clk());
@@ -455,20 +619,23 @@ namespace maxflow {
             double avg_size  = wl_passes > 0 ? (double)wl_sum_size / wl_passes : 0.0;
             double avg_edges = wl_passes > 0 ? (double)wl_sum_edges / wl_passes : 0.0;
             double avg_maxd  = wl_passes > 0 ? (double)wl_sum_maxdeg / wl_passes : 0.0;
-            double avg_per_thread = avg_size > 0 ? avg_edges / avg_size : 0.0;
+            double avg_threads = wl_passes > 0 ? (double)wl_sum_threads / wl_passes : 0.0;
+            double avg_hubs = wl_passes > 0 ? (double)wl_sum_hubs / wl_passes : 0.0;
+            double avg_per_thread = avg_threads > 0 ? avg_edges / avg_threads : 0.0;
             double imbalance = avg_per_thread > 0 ? avg_maxd / avg_per_thread : 0.0;
             double l0_share = t_bfs_kernel > 0 ? 100.0 * t_bfs_level0 / t_bfs_kernel : 0.0;
             std::fprintf(stderr, "  BFS level 0 only : %8.3f s  (%5.1f%% of BFS kernel time)\n", t_bfs_level0, l0_share);
             std::fprintf(stderr, "  degree           : sink %lld  source %lld  largest other %lld (vertex %d)  vertices with >=64 edges %d, >=1024 edges %d\n",
                          deg(net.sink), deg(net.source), max_deg, max_deg_v, n_deg64, n_deg1024);
-            std::fprintf(stderr, "  worklist per pass: average %.1f vertices, largest %lld\n", avg_size, wl_max_size);
+            std::fprintf(stderr, "  worklist per pass: average %.1f vertices (%.1f of them hubs, one warp each), largest %lld\n", avg_size, avg_hubs, wl_max_size);
+            std::fprintf(stderr, "  hub threshold    : %d edges (0 = Fix B off)\n", hub_deg);
             std::fprintf(stderr, "  edges per pass   : total %.1f, per thread %.1f, longest thread %.1f (worst %lld)\n",
                          avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg);
             std::fprintf(stderr, "  imbalance        : longest thread does %.1fx the average; passes with a >=1024-edge thread: %lld of %lld\n",
                          imbalance, wl_hub_passes, wl_passes);
-            std::fprintf(stderr, "[diag] V=%d E=%d sink_deg=%lld max_deg=%lld n_deg64=%d n_deg1024=%d relabels=%ld bfs_levels=%ld bfs_kernel_s=%.6f bfs_l0_s=%.6f passes=%lld avg_wl=%.1f max_wl=%lld avg_edges=%.1f avg_per_thread=%.2f avg_longest=%.1f worst_longest=%lld imbalance=%.1f hub_passes=%lld\n",
+            std::fprintf(stderr, "[diag] V=%d E=%d sink_deg=%lld max_deg=%lld n_deg64=%d n_deg1024=%d relabels=%ld bfs_levels=%ld bfs_kernel_s=%.6f bfs_l0_s=%.6f passes=%lld avg_wl=%.1f max_wl=%lld avg_edges=%.1f avg_per_thread=%.2f avg_longest=%.1f worst_longest=%lld imbalance=%.1f hub_passes=%lld avg_hubs=%.1f hub_deg=%d\n",
                          V, E, deg(net.sink), max_deg, n_deg64, n_deg1024, n_relabels, n_bfs_levels, t_bfs_kernel, t_bfs_level0,
-                         wl_passes, avg_size, wl_max_size, avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg, imbalance, wl_hub_passes);
+                         wl_passes, avg_size, wl_max_size, avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg, imbalance, wl_hub_passes, avg_hubs, hub_deg);
           }
           std::fprintf(stderr, "  threads launched, push-relabel  : %lld\n", threads_push);
           std::fprintf(stderr, "  threads launched, remove-invalid: %lld\n", threads_remove);
@@ -516,7 +683,8 @@ namespace maxflow {
       int* d_flag = nullptr;
 
       int* d_worklist = nullptr;
-      int* d_worklist_count = nullptr;
+      int* d_counts = nullptr;
+      int* d_hub_list = nullptr;
 
       int* d_frontier_in = nullptr;
       int* d_frontier_out = nullptr;

@@ -38,7 +38,7 @@ LOG="$OUT/run.log"
   echo "lists       : ${LISTS[*]}"
 } > "$OUT/env.txt"
 
-KEYS="V E sink_deg max_deg n_deg64 n_deg1024 relabels bfs_levels bfs_kernel_s bfs_l0_s passes avg_wl max_wl avg_edges avg_per_thread avg_longest worst_longest imbalance hub_passes"
+KEYS="V E sink_deg max_deg n_deg64 n_deg1024 relabels bfs_levels bfs_kernel_s bfs_l0_s passes avg_wl max_wl avg_edges avg_per_thread avg_longest worst_longest imbalance hub_passes avg_hubs hub_deg"
 STAGES="kern.collect kern.build_flownet kern.maxflow kern.classify kern.apply"
 
 {
@@ -109,6 +109,9 @@ Times in this table include the profiling synchronisations; true times are in ns
   imbalance       avg_longest / avg_per_thread : how much longer the slowest thread works
                   than the average one; a kernel finishes only when its slowest thread does
   hub_passes      passes in which some thread had to scan 1024 or more edges
+  avg_hubs        active vertices per pass handled by a whole warp (Fix B); 0 when Fix B is off
+  hub_deg         Fix B threshold: vertices with this many edges or more get a warp (0 = off).
+                  With Fix B, a hub's "thread" work is ceil(edges/32), since 32 lanes share it
   *_s (stages)    kernelization sub-stages from the pipeline timer:
                   collect = read the CCG, build_flownet = build the double-cover network on the CPU,
                   maxflow = GPU solve (incl. copies and min-cut extraction), classify, apply
