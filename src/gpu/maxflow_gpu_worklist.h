@@ -179,6 +179,15 @@ namespace maxflow {
           }
         }
 
+        //  Fix A: BFS level 0 (the sink's level) with one thread per sink edge. On by default; MAXFLOW_SINK_BFS=0 restores the old one-thread level 0, for before/after comparisons
+        bool sink_level_parallel = true;
+        {
+          const char* env_sink = std::getenv("MAXFLOW_SINK_BFS");
+          if (env_sink != nullptr && std::atoi(env_sink) == 0) {
+            sink_level_parallel = false;
+          }
+        }
+
         int threads = 256;
         int blocks_v = (V + threads - 1) / threads;
         int blocks_max = (std::max(V, E) + threads - 1) / threads;
@@ -193,6 +202,15 @@ namespace maxflow {
           int blocks_s = (src_count + threads - 1) / threads;
           gpu_saturate_source_kernel<<<blocks_s, threads>>>(src_start, src_end, net.source, d_edge_dst, d_capacity, d_residual_capacity, d_reverse_index, d_excess);
           MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        //  Edge range of the sink, for the parallel BFS level 0 (Fix A)
+        int sink_start = net.offset[net.sink];
+        int sink_end = net.offset[net.sink + 1];
+        int sink_count = sink_end - sink_start;
+        int blocks_sink = (sink_count + threads - 1) / threads;
+        if (sink_count <= 0) {
+          sink_level_parallel = false;
         }
 
 #ifdef MAXFLOW_PROFILE
@@ -279,7 +297,11 @@ namespace maxflow {
 #endif
                 int bfs_flag = 0;
                 MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &bfs_flag, sizeof(int), cudaMemcpyHostToDevice));
-                gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
+                if (level == 0 && sink_level_parallel) {
+                  gpu_bfs_sink_level_kernel<<<blocks_sink, threads>>>(sink_start, sink_end, V, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
+                } else {
+                  gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
+                }
                 MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 #ifdef MAXFLOW_PROFILE
                 t_bfs_kernel += secs(tk0, clk());
@@ -309,7 +331,11 @@ namespace maxflow {
                 int out_zero = 0;
                 MAXFLOW_CUDA_CHECK(cudaMemcpy(d_frontier_count, &out_zero, sizeof(int), cudaMemcpyHostToDevice));
                 int blocks_f = (frontier_size + threads - 1) / threads;
-                gpu_bfs_frontier_step_kernel<<<blocks_f, threads>>>(frontier_size, V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_frontier_in, d_frontier_out, d_frontier_count);
+                if (level == 0 && sink_level_parallel) {
+                  gpu_bfs_frontier_sink_level_kernel<<<blocks_sink, threads>>>(sink_start, sink_end, V, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_frontier_out, d_frontier_count);
+                } else {
+                  gpu_bfs_frontier_step_kernel<<<blocks_f, threads>>>(frontier_size, V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_frontier_in, d_frontier_out, d_frontier_count);
+                }
                 MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
 #ifdef MAXFLOW_PROFILE
                 t_bfs_kernel += secs(tk0, clk());

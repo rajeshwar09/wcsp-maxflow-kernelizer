@@ -72,6 +72,35 @@ namespace maxflow {
     }
   }
 
+  //  Algorithm 4: BFS level 0 only -- the sink's own level, one thread per sink half-edge
+  //
+  //  At level 0 only the sink is on the current level, so gpu_bfs_step_kernel gives the whole level to ONE thread, which walks every edge of the sink
+  __global__ void gpu_bfs_sink_level_kernel(int sink_start, int sink_end, int num_nodes, const int* edge_dst, const cap_t* residual_capacity, const int* reverse_index, int* height, int* flag) {
+    int e = sink_start + blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= sink_end) {
+      return;
+    }
+    int v = edge_dst[e];
+    if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
+      height[v] = 1;
+      *flag = 1;  // => host must launch level 1
+    }
+  }
+
+  __global__ void gpu_bfs_frontier_sink_level_kernel(int sink_start, int sink_end, int num_nodes, const int* edge_dst, const cap_t* residual_capacity, const int* reverse_index, int* height, int* frontier_out, int* out_count) {
+    int e = sink_start + blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= sink_end) {
+      return;
+    }
+    int v = edge_dst[e];
+    if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
+      if (atomicCAS(&height[v], num_nodes, 1) == num_nodes) {
+        int pos = atomicAdd(out_count, 1);
+        frontier_out[pos] = v;
+      }
+    }
+  }
+
   //  Algorithm 4: One BFS layer
   //  For each u at current level, look at out-edges
   //  If v->u has residual & v is undiscovered
