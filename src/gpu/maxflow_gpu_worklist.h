@@ -337,6 +337,79 @@ namespace maxflow {
     }
   }
 
+  // Fix D: one BFS level (algorithm 4) split by vertex size, like Fix B and Fix C split push-relabel.
+  //
+  // gpu_bfs_step_kernel gives every vertex ONE thread, so a big vertex on the current level is walked by a
+  // single thread (16,391 edges on PackupWeighted, about 12 ms for one launch). The three kernels below do
+  // the same level together: small vertices one thread each, hubs one warp each, big vertices one block each.
+  // The hub and big lists never change (a vertex's degree is fixed), so they are built once per solve.
+  //
+  // The result is exactly the same as gpu_bfs_step_kernel: every write in a level is height[v] = level + 1
+  // on a vertex that still has height |V|, so it does not matter which thread does it or in which order,
+  // and height[u] == level is never changed during the level
+
+  // Fix D: vertices with fewer than skip_deg edges, one thread each (the others are in the two lists)
+  __global__ void wl_bfs_step_small_kernel(int num_nodes, int level, int skip_deg, const int* offset, const int* edge_dst, const cap_t* residual_capacity, const int* reverse_index, int* height, int* flag) {
+    int u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= num_nodes) {
+      return;
+    }
+    if (height[u] != level) {
+      return;
+    }
+    int start = offset[u];
+    int end = offset[u + 1];
+    if (end - start >= skip_deg) {
+      return; // in the hub list or the big list
+    }
+    for (int e = start; e < end; e++) {
+      int v = edge_dst[e];
+      //  v can step to u iff v->u has residual
+      if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
+        height[v] = level + 1;
+        *flag = 1;  // => host must launch another layer
+      }
+    }
+  }
+
+  // Fix D: hub vertices, ONE WARP per vertex of the fixed hub list; a warp whose vertex is not on this level leaves at once
+  __global__ void wl_bfs_step_hub_kernel(int list_size, int num_nodes, int level, const int* list, const int* offset, const int* edge_dst, const cap_t* residual_capacity, const int* reverse_index, int* height, int* flag) {
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x & 31;
+    if (warp >= list_size) {
+      return;
+    }
+    int u = list[warp];
+    if (height[u] != level) {
+      return; // same value for all 32 lanes
+    }
+    for (int e = offset[u] + lane; e < offset[u + 1]; e += 32) {
+      int v = edge_dst[e];
+      if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
+        height[v] = level + 1;
+        *flag = 1;
+      }
+    }
+  }
+
+  // Fix D: big vertices, ONE BLOCK per vertex of the fixed big list; a block whose vertex is not on this level leaves at once
+  __global__ void wl_bfs_step_block_kernel(int list_size, int num_nodes, int level, const int* list, const int* offset, const int* edge_dst, const cap_t* residual_capacity, const int* reverse_index, int* height, int* flag) {
+    if ((int)blockIdx.x >= list_size) {
+      return;
+    }
+    int u = list[blockIdx.x];
+    if (height[u] != level) {
+      return; // same value for the whole block
+    }
+    for (int e = offset[u] + threadIdx.x; e < offset[u + 1]; e += blockDim.x) {
+      int v = edge_dst[e];
+      if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
+        height[v] = level + 1;
+        *flag = 1;
+      }
+    }
+  }
+
   // host solver
   class gpu_worklist_solver {
     public:
@@ -372,6 +445,7 @@ namespace maxflow {
         cudaFree(d_residual_capacity); cudaFree(d_reverse_index);
         cudaFree(d_excess); cudaFree(d_height); cudaFree(d_flag);
         cudaFree(d_worklist); cudaFree(d_counts); cudaFree(d_hub_list); cudaFree(d_big_list);
+        cudaFree(d_bfs_hub_list); cudaFree(d_bfs_big_list);
         cudaFree(d_frontier_in); cudaFree(d_frontier_out); cudaFree(d_frontier_count);
       }
 
@@ -479,6 +553,61 @@ namespace maxflow {
             }
           }
         }
+
+        //  Fix D: the BFS levels use the same two thresholds, but over ALL vertices (the source and the sink
+        //  can be on a BFS level too), so they are kept before the zeroing below. MAXFLOW_BFS_SPLIT=0 turns
+        //  Fix D off (every vertex gets one thread in the BFS levels, the old gpu_bfs_step_kernel)
+        bool bfs_split = true;
+        {
+          const char* env_split = std::getenv("MAXFLOW_BFS_SPLIT");
+          if (env_split != nullptr && std::atoi(env_split) == 0) {
+            bfs_split = false;
+          }
+        }
+        int bfs_hub_deg = hub_deg;
+        int bfs_block_deg = block_deg;
+        std::vector<int> h_bfs_hub, h_bfs_big;
+        if (bfs_split) {
+          for (int v = 0; v < V; v++) {
+            int d = net.offset[v + 1] - net.offset[v];
+            if (bfs_block_deg > 0 && d >= bfs_block_deg) {
+              h_bfs_big.push_back(v);
+            } else if (bfs_hub_deg > 0 && d >= bfs_hub_deg) {
+              h_bfs_hub.push_back(v);
+            }
+          }
+          if (h_bfs_hub.empty() && h_bfs_big.empty()) {
+            bfs_split = false; // nothing big enough: the old kernel is the same thing
+          }
+        }
+        //  a vertex below skip_deg edges is in neither list, so the small kernel must take it
+        int bfs_skip_deg = INT_MAX;
+        if (bfs_hub_deg > 0) {
+          bfs_skip_deg = std::min(bfs_skip_deg, bfs_hub_deg);
+        }
+        if (bfs_block_deg > 0) {
+          bfs_skip_deg = std::min(bfs_skip_deg, bfs_block_deg);
+        }
+        int bfs_hub_size = (int)h_bfs_hub.size();
+        int bfs_big_size = (int)h_bfs_big.size();
+        if (d_bfs_hub_list != nullptr) {
+          cudaFree(d_bfs_hub_list);
+          d_bfs_hub_list = nullptr;
+        }
+        if (d_bfs_big_list != nullptr) {
+          cudaFree(d_bfs_big_list);
+          d_bfs_big_list = nullptr;
+        }
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_bfs_hub_list, std::max(1, bfs_hub_size) * sizeof(int)));
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_bfs_big_list, std::max(1, bfs_big_size) * sizeof(int)));
+        if (bfs_hub_size > 0) {
+          MAXFLOW_CUDA_CHECK(cudaMemcpy(d_bfs_hub_list, h_bfs_hub.data(), bfs_hub_size * sizeof(int), cudaMemcpyHostToDevice));
+        }
+        if (bfs_big_size > 0) {
+          MAXFLOW_CUDA_CHECK(cudaMemcpy(d_bfs_big_list, h_bfs_big.data(), bfs_big_size * sizeof(int), cudaMemcpyHostToDevice));
+        }
+        int blocks_bfs_hub = (bfs_hub_size * 32 + threads - 1) / threads;  // one warp per hub
+
         //  Each list can hold at most the vertices whose degree puts them in it
         int hub_capacity = 0;
         int big_capacity = 0;
@@ -608,6 +737,15 @@ namespace maxflow {
                 MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &bfs_flag, sizeof(int), cudaMemcpyHostToDevice));
                 if (level == 0 && sink_level_parallel) {
                   gpu_bfs_sink_level_kernel<<<blocks_sink, threads>>>(sink_start, sink_end, V, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
+                } else if (bfs_split) {
+                  //  Fix D: the three kernels together do one level; no sync is needed between them
+                  wl_bfs_step_small_kernel<<<blocks_v, threads>>>(V, level, bfs_skip_deg, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
+                  if (bfs_hub_size > 0) {
+                    wl_bfs_step_hub_kernel<<<blocks_bfs_hub, threads>>>(bfs_hub_size, V, level, d_bfs_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
+                  }
+                  if (bfs_big_size > 0) {
+                    wl_bfs_step_block_kernel<<<bfs_big_size, block_threads>>>(bfs_big_size, V, level, d_bfs_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
+                  }
                 } else {
                   gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
                 }
@@ -816,13 +954,15 @@ namespace maxflow {
             std::fprintf(stderr, "  worklist per pass: average %.1f vertices (%.1f of them hubs, one warp each), largest %lld\n", avg_size, avg_hubs, wl_max_size);
             std::fprintf(stderr, "  hub threshold    : %d edges (0 = Fix B off)\n", hub_deg);
             std::fprintf(stderr, "  block threshold  : %d edges, %d threads per block (0 = Fix C off); %.1f big vertices per pass, one block each\n", block_deg, block_threads, avg_bigs);
+            std::fprintf(stderr, "  BFS split        : %s; fixed lists %d hubs (one warp each), %d big vertices (one block each), checked every level\n",
+                         bfs_split ? "on" : "off (Fix D off)", bfs_split ? bfs_hub_size : 0, bfs_split ? bfs_big_size : 0);
             std::fprintf(stderr, "  edges per pass   : total %.1f, per thread %.1f, longest thread %.1f (worst %lld)\n",
                          avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg);
             std::fprintf(stderr, "  imbalance        : longest thread does %.1fx the average; passes with a >=1024-edge thread: %lld of %lld\n",
                          imbalance, wl_hub_passes, wl_passes);
-            std::fprintf(stderr, "[diag] V=%d E=%d sink_deg=%lld max_deg=%lld n_deg64=%d n_deg1024=%d relabels=%ld bfs_levels=%ld bfs_kernel_s=%.6f bfs_l0_s=%.6f passes=%lld avg_wl=%.1f max_wl=%lld avg_edges=%.1f avg_per_thread=%.2f avg_longest=%.1f worst_longest=%lld imbalance=%.1f hub_passes=%lld avg_hubs=%.1f hub_deg=%d avg_bigs=%.1f block_deg=%d\n",
+            std::fprintf(stderr, "[diag] V=%d E=%d sink_deg=%lld max_deg=%lld n_deg64=%d n_deg1024=%d relabels=%ld bfs_levels=%ld bfs_kernel_s=%.6f bfs_l0_s=%.6f passes=%lld avg_wl=%.1f max_wl=%lld avg_edges=%.1f avg_per_thread=%.2f avg_longest=%.1f worst_longest=%lld imbalance=%.1f hub_passes=%lld avg_hubs=%.1f hub_deg=%d avg_bigs=%.1f block_deg=%d bfs_hubs=%d bfs_bigs=%d\n",
                          V, E, deg(net.sink), max_deg, n_deg64, n_deg1024, n_relabels, n_bfs_levels, t_bfs_kernel, t_bfs_level0,
-                         wl_passes, avg_size, wl_max_size, avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg, imbalance, wl_hub_passes, avg_hubs, hub_deg, avg_bigs, block_deg);
+                         wl_passes, avg_size, wl_max_size, avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg, imbalance, wl_hub_passes, avg_hubs, hub_deg, avg_bigs, block_deg, bfs_split ? bfs_hub_size : 0, bfs_split ? bfs_big_size : 0);
           }
           std::fprintf(stderr, "  threads launched, push-relabel  : %lld\n", threads_push);
           std::fprintf(stderr, "  threads launched, remove-invalid: %lld\n", threads_remove);
@@ -873,6 +1013,8 @@ namespace maxflow {
       int* d_counts = nullptr;
       int* d_hub_list = nullptr;
       int* d_big_list = nullptr;
+      int* d_bfs_hub_list = nullptr;  // Fix D: fixed lists for the BFS levels
+      int* d_bfs_big_list = nullptr;
 
       int* d_frontier_in = nullptr;
       int* d_frontier_out = nullptr;

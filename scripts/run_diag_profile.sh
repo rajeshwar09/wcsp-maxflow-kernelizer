@@ -38,7 +38,7 @@ LOG="$OUT/run.log"
   echo "lists       : ${LISTS[*]}"
 } > "$OUT/env.txt"
 
-KEYS="V E sink_deg max_deg n_deg64 n_deg1024 relabels bfs_levels bfs_kernel_s bfs_l0_s passes avg_wl max_wl avg_edges avg_per_thread avg_longest worst_longest imbalance hub_passes avg_hubs hub_deg avg_bigs block_deg"
+KEYS="V E sink_deg max_deg n_deg64 n_deg1024 relabels bfs_levels bfs_kernel_s bfs_l0_s passes avg_wl max_wl avg_edges avg_per_thread avg_longest worst_longest imbalance hub_passes avg_hubs hub_deg avg_bigs block_deg bfs_hubs bfs_bigs"
 STAGES="kern.collect kern.build_flownet kern.maxflow kern.classify kern.apply"
 
 {
@@ -115,6 +115,8 @@ Times in this table include the profiling synchronisations; true times are in ns
   avg_bigs        active vertices per pass handled by a whole block (Fix C); 0 when Fix C is off
   block_deg       Fix C threshold: vertices with this many edges or more get a block (0 = off).
                   With Fix C, a big vertex's "thread" work is ceil(edges/threads per block)
+  bfs_hubs        vertices in the fixed BFS hub list, one warp each in every BFS level (Fix D; 0 = off)
+  bfs_bigs        vertices in the fixed BFS big list, one block each in every BFS level (Fix D; 0 = off)
   *_s (stages)    kernelization sub-stages from the pipeline timer:
                   collect = read the CCG, build_flownet = build the double-cover network on the CPU,
                   maxflow = GPU solve (incl. copies and min-cut extraction), classify, apply
