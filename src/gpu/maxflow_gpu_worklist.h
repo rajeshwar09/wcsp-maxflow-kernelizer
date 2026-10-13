@@ -433,6 +433,9 @@ namespace maxflow {
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_frontier_in,       V       * sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_frontier_out,      V       * sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_frontier_count,    1       * sizeof(int)));
+        //  Fix E: small pinned (page-locked) host buffer for the per-pass counts and the BFS flag; copies into
+        //  pinned memory go straight to the host, without the staging copy that ordinary memory needs
+        MAXFLOW_CUDA_CHECK(cudaMallocHost(&h_pinned, 4 * sizeof(int)));
 
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_offset, net.offset.data(), (V + 1) * sizeof(int), cudaMemcpyHostToDevice));
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_edge_dst, net.edge_dst.data(), E * sizeof(int), cudaMemcpyHostToDevice));
@@ -447,6 +450,7 @@ namespace maxflow {
         cudaFree(d_worklist); cudaFree(d_counts); cudaFree(d_hub_list); cudaFree(d_big_list);
         cudaFree(d_bfs_hub_list); cudaFree(d_bfs_big_list);
         cudaFree(d_frontier_in); cudaFree(d_frontier_out); cudaFree(d_frontier_count);
+        cudaFreeHost(h_pinned);
       }
 
       gpu_worklist_solver(const gpu_worklist_solver&) = delete;
@@ -653,19 +657,57 @@ namespace maxflow {
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_hub_list, std::max(1, hub_capacity) * sizeof(int)));
         MAXFLOW_CUDA_CHECK(cudaMalloc(&d_big_list, std::max(1, big_capacity) * sizeof(int)));
 
+        //  Fix E: wait for the GPU only where the CPU really needs a number from it. All launches go to the
+        //  same (default) stream, so the GPU already runs them in order; the explicit waits after
+        //  push-relabel and after remove-invalid only made the GPU sit idle while the CPU caught up. Now
+        //  each pass waits once, when it reads the three list sizes, and each BFS level once, for its flag.
+        //  MAXFLOW_ASYNC=0 turns Fix E off (a wait after every step, as before). The profile build always
+        //  waits after every step, because its per-step timers need it
+        bool async_passes = true;
+        {
+          const char* env_async = std::getenv("MAXFLOW_ASYNC");
+          if (env_async != nullptr && std::atoi(env_async) == 0) {
+            async_passes = false;
+          }
+        }
+#ifdef MAXFLOW_PROFILE
+        async_passes = false;
+#endif
+        //  after a group of launches: either wait for them (old way) or only check that they launched
+        auto after_launch = [&]() {
+          if (async_passes) {
+            MAXFLOW_CUDA_CHECK(cudaGetLastError());
+          } else {
+            MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+          }
+        };
+
         int small_size = 0;  // vertices in d_worklist, one thread each
         int hub_size = 0;    // vertices in d_hub_list, one warp each
         int big_size = 0;    // vertices in d_big_list, one block each
         int work_size = 0;   // all active vertices = small_size + hub_size + big_size
         auto build_lists = [&]() {
-          MAXFLOW_CUDA_CHECK(cudaMemset(d_counts, 0, 3 * sizeof(int)));
-          wl_build_worklist_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, hub_deg, block_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_big_list, d_counts);
-          MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
-          int h_counts[3];
-          MAXFLOW_CUDA_CHECK(cudaMemcpy(h_counts, d_counts, 3 * sizeof(int), cudaMemcpyDeviceToHost));
-          small_size = h_counts[0];
-          hub_size = h_counts[1];
-          big_size = h_counts[2];
+          if (async_passes) {
+            //  Fix E: the one wait of the pass. It also covers the push-relabel and remove-invalid
+            //  launches of the previous pass, which are ahead of these in the stream
+            MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_counts, 0, 3 * sizeof(int)));
+            wl_build_worklist_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, hub_deg, block_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_big_list, d_counts);
+            MAXFLOW_CUDA_CHECK(cudaGetLastError());
+            MAXFLOW_CUDA_CHECK(cudaMemcpyAsync(h_pinned, d_counts, 3 * sizeof(int), cudaMemcpyDeviceToHost));
+            MAXFLOW_CUDA_CHECK(cudaStreamSynchronize(0));
+            small_size = h_pinned[0];
+            hub_size = h_pinned[1];
+            big_size = h_pinned[2];
+          } else {
+            MAXFLOW_CUDA_CHECK(cudaMemset(d_counts, 0, 3 * sizeof(int)));
+            wl_build_worklist_kernel<<<blocks_v, threads>>>(V, net.source, net.sink, hub_deg, block_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_big_list, d_counts);
+            MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+            int h_counts[3];
+            MAXFLOW_CUDA_CHECK(cudaMemcpy(h_counts, d_counts, 3 * sizeof(int), cudaMemcpyDeviceToHost));
+            small_size = h_counts[0];
+            hub_size = h_counts[1];
+            big_size = h_counts[2];
+          }
           work_size = small_size + hub_size + big_size;
         };
 
@@ -739,7 +781,11 @@ namespace maxflow {
             n_relabels++;
 #endif
             gpu_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
-            MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+            if (use_frontier_bfs) {
+              MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+            } else {
+              after_launch();
+            }
 
             if (!use_frontier_bfs) {
               int level = 0;
@@ -748,7 +794,11 @@ namespace maxflow {
                 auto tk0 = clk();
 #endif
                 int bfs_flag = 0;
-                MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &bfs_flag, sizeof(int), cudaMemcpyHostToDevice));
+                if (async_passes) {
+                  MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_flag, 0, sizeof(int)));  // Fix E: no host copy needed to clear it
+                } else {
+                  MAXFLOW_CUDA_CHECK(cudaMemcpy(d_flag, &bfs_flag, sizeof(int), cudaMemcpyHostToDevice));
+                }
                 if (level == 0 && sink_level_parallel) {
                   gpu_bfs_sink_level_kernel<<<blocks_sink, threads>>>(sink_start, sink_end, V, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
                 } else if (bfs_split) {
@@ -763,7 +813,7 @@ namespace maxflow {
                 } else {
                   gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
                 }
-                MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+                after_launch();
 #ifdef MAXFLOW_PROFILE
                 t_bfs_kernel += secs(tk0, clk());
                 if (level == 0) {
@@ -771,7 +821,14 @@ namespace maxflow {
                 }
                 auto tm0 = clk();
 #endif
-                MAXFLOW_CUDA_CHECK(cudaMemcpy(&bfs_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
+                if (async_passes) {
+                  //  Fix E: the one wait of the level
+                  MAXFLOW_CUDA_CHECK(cudaMemcpyAsync(h_pinned + 3, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
+                  MAXFLOW_CUDA_CHECK(cudaStreamSynchronize(0));
+                  bfs_flag = h_pinned[3];
+                } else {
+                  MAXFLOW_CUDA_CHECK(cudaMemcpy(&bfs_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
+                }
 #ifdef MAXFLOW_PROFILE
                 t_bfs_copy += secs(tm0, clk());
                 n_bfs_levels++;
@@ -897,7 +954,7 @@ namespace maxflow {
             if (big_size > 0) {
               wl_push_relabel_block_kernel<<<big_size, block_threads>>>(big_size, V, kernel_cycles, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);  // one block per big vertex
             }
-            MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+            after_launch();  // Fix E: no wait here, remove-invalid runs after push-relabel anyway
 #ifdef MAXFLOW_PROFILE
             t_push += secs(tp0, clk());
 #endif
@@ -923,7 +980,7 @@ namespace maxflow {
               if (big_size > 0) {
                 wl_remove_invalid_block_kernel<<<big_size, block_threads>>>(big_size, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);  // one block per big vertex
               }
-              MAXFLOW_CUDA_CHECK(cudaDeviceSynchronize());
+              after_launch();  // Fix E: no wait here, the next pass waits once when it reads the list sizes
 #ifdef MAXFLOW_PROFILE
               t_remove += secs(tr0, clk());
 #endif
@@ -1029,6 +1086,7 @@ namespace maxflow {
       int* d_big_list = nullptr;
       int* d_bfs_hub_list = nullptr;  // Fix D: fixed lists for the BFS levels
       int* d_bfs_big_list = nullptr;
+      int* h_pinned = nullptr;        // Fix E: [0..2] list sizes, [3] BFS flag
 
       int* d_frontier_in = nullptr;
       int* d_frontier_out = nullptr;
