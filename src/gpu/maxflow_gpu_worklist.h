@@ -543,7 +543,21 @@ namespace maxflow {
             block_deg = std::max(0, std::atoi(env_blk));
           }
         }
+        //  Fix D2: threads per block for the big vertices, chosen once from the largest vertex (not the
+        //  source or the sink, which push-relabel never processes): the smallest of 256, 512 and 1024 that
+        //  gives each thread at most 16 edges of that vertex. MAXFLOW_BLOCK_THREADS=N still sets it by hand
         int block_threads = 256;
+        {
+          int largest = 0;
+          for (int v = 0; v < V; v++) {
+            if (v != net.source && v != net.sink) {
+              largest = std::max(largest, net.offset[v + 1] - net.offset[v]);
+            }
+          }
+          while (block_threads < 1024 && (largest + block_threads - 1) / block_threads > 16) {
+            block_threads *= 2;
+          }
+        }
         {
           const char* env_bt = std::getenv("MAXFLOW_BLOCK_THREADS");
           if (env_bt != nullptr) {
@@ -960,9 +974,9 @@ namespace maxflow {
                          avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg);
             std::fprintf(stderr, "  imbalance        : longest thread does %.1fx the average; passes with a >=1024-edge thread: %lld of %lld\n",
                          imbalance, wl_hub_passes, wl_passes);
-            std::fprintf(stderr, "[diag] V=%d E=%d sink_deg=%lld max_deg=%lld n_deg64=%d n_deg1024=%d relabels=%ld bfs_levels=%ld bfs_kernel_s=%.6f bfs_l0_s=%.6f passes=%lld avg_wl=%.1f max_wl=%lld avg_edges=%.1f avg_per_thread=%.2f avg_longest=%.1f worst_longest=%lld imbalance=%.1f hub_passes=%lld avg_hubs=%.1f hub_deg=%d avg_bigs=%.1f block_deg=%d bfs_hubs=%d bfs_bigs=%d\n",
+            std::fprintf(stderr, "[diag] V=%d E=%d sink_deg=%lld max_deg=%lld n_deg64=%d n_deg1024=%d relabels=%ld bfs_levels=%ld bfs_kernel_s=%.6f bfs_l0_s=%.6f passes=%lld avg_wl=%.1f max_wl=%lld avg_edges=%.1f avg_per_thread=%.2f avg_longest=%.1f worst_longest=%lld imbalance=%.1f hub_passes=%lld avg_hubs=%.1f hub_deg=%d avg_bigs=%.1f block_deg=%d bfs_hubs=%d bfs_bigs=%d block_threads=%d\n",
                          V, E, deg(net.sink), max_deg, n_deg64, n_deg1024, n_relabels, n_bfs_levels, t_bfs_kernel, t_bfs_level0,
-                         wl_passes, avg_size, wl_max_size, avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg, imbalance, wl_hub_passes, avg_hubs, hub_deg, avg_bigs, block_deg, bfs_split ? bfs_hub_size : 0, bfs_split ? bfs_big_size : 0);
+                         wl_passes, avg_size, wl_max_size, avg_edges, avg_per_thread, avg_maxd, wl_max_maxdeg, imbalance, wl_hub_passes, avg_hubs, hub_deg, avg_bigs, block_deg, bfs_split ? bfs_hub_size : 0, bfs_split ? bfs_big_size : 0, block_threads);
           }
           std::fprintf(stderr, "  threads launched, push-relabel  : %lld\n", threads_push);
           std::fprintf(stderr, "  threads launched, remove-invalid: %lld\n", threads_remove);
