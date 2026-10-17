@@ -73,11 +73,11 @@ skip() {
   say "$(printf '%-22s skipped, %s' "$1" "$2")"
 }
 
-# [CORE] the pipeline program (cpu and gpu builds) and the two instance tools
+# [CORE] the pipeline program (cpu and gpu builds) and the two instance tools, the gpu build keeps line info for the ncu source view
 if [ "$what" = "core" ] || [ "$what" = "all" ]; then
   compile e2e_solve g++ -std=c++17 -O2 $grb_flags -I. apps/e2e_solve.cpp $grb_src -o e2e_solve $grb_libs -lopenblas
   if [ -n "$arch" ]; then
-    compile e2e_solve_gpu nvcc -x cu -std=c++17 -O2 -arch="$arch" -DUSE_GPU $grb_flags -I. apps/e2e_solve.cpp $grb_src -o e2e_solve_gpu $grb_libs -lopenblas
+    compile e2e_solve_gpu nvcc -x cu -std=c++17 -O2 -arch="$arch" -lineinfo -DUSE_GPU $grb_flags -I. apps/e2e_solve.cpp $grb_src -o e2e_solve_gpu $grb_libs -lopenblas
   else
     skip e2e_solve_gpu "no nvcc or no GPU"
   fi
