@@ -27,3 +27,6 @@ results/
 # [EDITOR] editor and system files
 .vscode/
 .DS_Store
+
+# [PYTHON] cache folder made when one script imports another
+__pycache__/
