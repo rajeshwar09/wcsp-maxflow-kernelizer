@@ -1,12 +1,8 @@
-// --------------------------------------------------
-// apps/kernelizer_maxflow_test.cpp
-//
-// Standalone test for KernelizerMaxflow
-// Builds small graphs by hand with KNOWN LP-optimal solutions,
-// runs our max-flow kernelizer, and checks the results
-//
-// No Gurobi needed. Only Boost 
-// --------------------------------------------------
+// gate test for KernelizerMaxflow: 6 small graphs made by hand whose LP optimum is known,
+// the max-flow kernelizer runs on each and its assignments are checked, no Gurobi needed
+// build: g++ -std=c++17 -O2 -I. apps/kernelizer_maxflow_test.cpp -o kmf_test -lopenblas
+// usage: ./kmf_test
+// exit code: 0 when all 6 pass, 1 otherwise
 
 #include <iostream>
 #include <map>
@@ -14,47 +10,26 @@
 #include <vector>
 #include <cmath>
 
-// This include pulls in everything:
-//   KernelizerMaxflow.h
-//     - Kernelizer.h
-//     - ConstraintCompositeGraph.h (defines graph_t, vertex_weight_t)
-//     - graph_csr.h, maxflow_static.h (our solvers)
+// brings in Kernelizer.h, ConstraintCompositeGraph.h (graph_t, vertex weights) and our CPU solver
 #include "src/integration/KernelizerMaxflow.h"
 
-// --------------------------------------------------
-// Type aliases matching ConstraintCompositeGraph<> defaults:
-//   variable_id_t = intmax_t
-//   weight_t = double
-//   graph_t = boost::adjacency_list<vecS, listS, undirectedS, ...>
-// --------------------------------------------------
+// [TYPES] same as the ConstraintCompositeGraph<> defaults: variable id intmax_t, weight double, boost adjacency_list graph
 using CCG = ConstraintCompositeGraph<>;
 using graph_t = CCG::graph_t;
 using vertex_t = boost::graph_traits<graph_t>::vertex_descriptor;
 using var_id_t = CCG::variable_id_t;
 using weight_t = CCG::weight_t;
 
-// --------------------------------------------------
-// Helper: add a vertex with given variable_id and weight
-//
-// The CCG graph stores two properties per vertex:
-//   vertex_name   = variable ID (intmax_t, >= 0 for real variables)
-//   vertex_weight = weight (double)
-//
-// This helper wraps the Boost API for clarity.
-// --------------------------------------------------
-vertex_t add_ccg_vertex(graph_t& g, var_id_t id, weight_t weight)
-{
+// [HELPER] adds a vertex with a variable id (vertex_name, >= 0 for real variables) and a weight (vertex_weight)
+vertex_t add_ccg_vertex(graph_t& g, var_id_t id, weight_t weight) {
   vertex_t v = boost::add_vertex(g);
   boost::put(boost::vertex_name, g, v, id);
   boost::put(boost::vertex_weight, g, v, weight);
   return v;
 }
 
-// --------------------------------------------------
-// Helper: count remaining vertices in a graph
-// --------------------------------------------------
-int count_vertices(const graph_t& g)
-{
+// [HELPER] number of vertices left in the graph
+int count_vertices(const graph_t& g) {
   int count = 0;
   auto [vi, vi_end] = boost::vertices(g);
   for (auto it = vi; it != vi_end; ++it)
@@ -62,11 +37,8 @@ int count_vertices(const graph_t& g)
   return count;
 }
 
-// --------------------------------------------------
-// Helper: print assignments and kernel
-// --------------------------------------------------
-void print_result(const std::string& name, const std::map<var_id_t, bool>& assignments, const graph_t& g)
-{
+// [HELPER] prints the fixed assignments and the size of the kernel left
+void print_result(const std::string& name, const std::map<var_id_t, bool>& assignments, const graph_t& g) {
   std::cout << "  Fixed assignments:\n";
   if (assignments.empty())
     std::cout << "    (none — all vertices remain in kernel)\n";
@@ -79,26 +51,10 @@ void print_result(const std::string& name, const std::map<var_id_t, bool>& assig
   std::cout << "  Remaining kernel size: " << remaining << " vertices\n";
 }
 
-// --------------------------------------------------
-// TEST 1: Single edge  P(5) -- Q(3)
-//
-// LP relaxation:
-//   minimize  5·x_P + 3·x_Q
-//   subject to:  x_P + x_Q >= 1
-//                0 <= x_P, x_Q <= 1
-//
-// Optimal LP solution:  x_P = 0,  x_Q = 1
-//   (setting Q=1 covers the edge at cost 3, which is cheaper
-//    than setting P=1 at cost 5)
-//
-// LP value = 3.  This solution is UNIQUE.
-//
-// Expected NT result:
-//   P - false (not in cover),  Q - true (in cover)
-//   Kernel is empty.
-// --------------------------------------------------
-bool test_single_edge()
-{
+// [TEST1] single edge P(5) - Q(3)
+// LP: minimize 5 x_P + 3 x_Q with x_P + x_Q >= 1, the only optimum is x_P = 0, x_Q = 1 (value 3)
+// expected: P = 0, Q = 1, empty kernel
+bool test_single_edge() {
   std::cout << "--- Test 1: Single edge P(5)--Q(3) ---\n";
 
   graph_t g;
@@ -112,22 +68,21 @@ bool test_single_edge()
 
   print_result("single_edge", assignments, g);
 
-  // Verify
   bool pass = true;
 
-  // Q (id=1) should be in cover (true)
+  // [CHECK] Q (id 1) in the cover
   if (assignments.count(1) == 0 || assignments[1] != true) {
     std::cout << "  FAIL: expected variable 1 (Q) = true\n";
     pass = false;
   }
 
-  // P (id=0) should NOT be in cover (false)
+  // [CHECK] P (id 0) not in the cover
   if (assignments.count(0) == 0 || assignments[0] != false) {
     std::cout << "  FAIL: expected variable 0 (P) = false\n";
     pass = false;
   }
 
-  // Kernel should be empty
+  // [CHECK] empty kernel
   if (count_vertices(g) != 0) {
     std::cout << "  FAIL: expected empty kernel, got "
               << count_vertices(g) << " vertices\n";
@@ -138,32 +93,14 @@ bool test_single_edge()
   return pass;
 }
 
-// --------------------------------------------------
-// TEST 2: Star graph  S(1) -- L1(10), S(1) -- L2(10), S(1) -- L3(10)
-//
-// Center vertex S has weight 1, three leaves each have weight 10.
-//
-// LP relaxation:
-//   minimize  1·x_S + 10·x_L1 + 10·x_L2 + 10·x_L3
-//   subject to:  x_S + x_L1 >= 1
-//                x_S + x_L2 >= 1
-//                x_S + x_L3 >= 1
-//
-// Optimal LP solution:  x_S = 1,  x_L1 = x_L2 = x_L3 = 0
-//   (covering center at cost 1 is far cheaper than any leaf combo)
-//
-// LP value = 1.  This solution is UNIQUE.
-//
-// Expected NT result:
-//   S - true (in cover),  L1, L2, L3 - false (not in cover)
-//   Kernel is empty.
-// --------------------------------------------------
-bool test_star_graph()
-{
+// [TEST2] star: centre S(1) joined to leaves L1(10), L2(10), L3(10)
+// LP: the only optimum takes the centre, x_S = 1 and every leaf 0 (value 1)
+// expected: S = 1, L1 = L2 = L3 = 0, empty kernel
+bool test_star_graph() {
   std::cout << "--- Test 2: Star graph S(1) -- L1(10), L2(10), L3(10) ---\n";
 
   graph_t g;
-  vertex_t S  = add_ccg_vertex(g, 0, 1.0);   // center, weight 1
+  vertex_t S  = add_ccg_vertex(g, 0, 1.0);   // centre, weight 1
   vertex_t L1 = add_ccg_vertex(g, 1, 10.0);  // leaf 1, weight 10
   vertex_t L2 = add_ccg_vertex(g, 2, 10.0);  // leaf 2, weight 10
   vertex_t L3 = add_ccg_vertex(g, 3, 10.0);  // leaf 3, weight 10
@@ -180,13 +117,13 @@ bool test_star_graph()
 
   bool pass = true;
 
-  // S (id=0) should be in cover
+  // [CHECK] S (id 0) in the cover
   if (assignments.count(0) == 0 || assignments[0] != true) {
     std::cout << "  FAIL: expected variable 0 (S) = true\n";
     pass = false;
   }
 
-  // L1, L2, L3 (ids 1,2,3) should NOT be in cover
+  // [CHECK] leaves (ids 1, 2, 3) not in the cover
   for (int id = 1; id <= 3; ++id) {
     if (assignments.count(id) == 0 || assignments[id] != false) {
       std::cout << "  FAIL: expected variable " << id << " = false\n";
@@ -194,7 +131,7 @@ bool test_star_graph()
     }
   }
 
-  // Kernel should be empty
+  // [CHECK] empty kernel
   if (count_vertices(g) != 0) {
     std::cout << "  FAIL: expected empty kernel\n";
     pass = false;
@@ -204,26 +141,10 @@ bool test_star_graph()
   return pass;
 }
 
-// --------------------------------------------------
-// TEST 3: Path graph  A(2) -- B(3) -- C(4) -- D(1)
-//
-// LP relaxation:
-//   minimize  2·x_A + 3·x_B + 4·x_C + 1·x_D
-//   subject to:  x_A + x_B >= 1
-//                x_B + x_C >= 1
-//                x_C + x_D >= 1
-//
-// Optimal LP solution:  x_A = 0, x_B = 1, x_C = 0, x_D = 1
-//   value = 0 + 3 + 0 + 1 = 4
-//   This is the unique integer AND LP optimal (since integer
-//   solution achieves LP lower bound).
-//
-// Expected NT result:
-//   A - false,  B - true,  C - false,  D - true
-//   Kernel is empty.
-// --------------------------------------------------
-bool test_path_graph()
-{
+// [TEST3] path A(2) - B(3) - C(4) - D(1)
+// LP: the only optimum is A = 0, B = 1, C = 0, D = 1 (value 4), it is integer so it is also the integer optimum
+// expected: A = 0, B = 1, C = 0, D = 1, empty kernel
+bool test_path_graph() {
   std::cout << "--- Test 3: Path A(2)--B(3)--C(4)--D(1) ---\n";
 
   graph_t g;
@@ -244,7 +165,7 @@ bool test_path_graph()
 
   bool pass = true;
 
-  // A=false, B=true, C=false, D=true
+  // [CHECK] A = 0, B = 1, C = 0, D = 1
   bool expected[] = {false, true, false, true};
   for (int id = 0; id <= 3; ++id) {
     if (assignments.count(id) == 0 || assignments[id] != expected[id]) {
@@ -254,6 +175,7 @@ bool test_path_graph()
     }
   }
 
+  // [CHECK] empty kernel
   if (count_vertices(g) != 0) {
     std::cout << "  FAIL: expected empty kernel\n";
     pass = false;
@@ -263,28 +185,11 @@ bool test_path_graph()
   return pass;
 }
 
-// --------------------------------------------------
-// TEST 4: Triangle  A(10) -- B(6) -- C(4) -- A
-//
-// LP relaxation:
-//   minimize  10·x_A + 6·x_B + 4·x_C
-//   subject to:  x_A + x_B >= 1
-//                x_A + x_C >= 1
-//                x_B + x_C >= 1
-//
-// This has MULTIPLE optimal LP solutions, all with value 10:
-//   (a) x_A = 0.5, x_B = 0.5, x_C = 0.5  → value = 10
-//   (b) x_A = 0,   x_B = 1,   x_C = 1    → value = 10
-//
-// The max-flow solver may find EITHER one due to min-cut
-// non-uniqueness (risk R2 from Module 2). Both are correct.
-//
-// We verify:
-//   - LP objective value = 10 regardless of which solution
-//   - All edge constraints are satisfied
-// --------------------------------------------------
-bool test_triangle()
-{
+// [TEST4] triangle A(10) - B(6) - C(4) - A
+// LP: more than one optimum with value 10, all at 0.5 or A = 0, B = 1, C = 1
+// the min cut is not unique so the solver may give either one, both are right
+// expected: LP value 10 for whatever assignment comes out
+bool test_triangle() {
   std::cout << "--- Test 4: Triangle A(10)--B(6)--C(4) ---\n";
 
   graph_t g;
@@ -302,10 +207,7 @@ bool test_triangle()
 
   print_result("triangle", assignments, g);
 
-  // Compute LP objective value from assignments:
-  //   fixed-1 vertices contribute their full weight
-  //   fixed-0 vertices contribute 0
-  //   remaining (0.5) vertices contribute weight * 0.5
+  // [CHECK] LP value: a vertex fixed to 1 adds its weight, fixed to 0 adds nothing, left in the kernel (0.5) adds half
   double weights[] = {10.0, 6.0, 4.0};
   double lp_value = 0.0;
 
@@ -331,16 +233,10 @@ bool test_triangle()
   return pass;
 }
 
-// --------------------------------------------------
-// TEST 5: Isolated vertex  V(7)  (no edges)
-//
-// A vertex with no edges is trivially NOT in the cover (x=0).
-// The LP has no constraints, so minimizing 7·x_V gives x_V=0.
-//
-// Expected: V - false, kernel empty.
-// --------------------------------------------------
-bool test_isolated_vertex()
-{
+// [TEST5] isolated vertex V(7) with no edges
+// LP: no constraint, so minimizing 7 x_V gives x_V = 0
+// expected: V = 0, empty kernel
+bool test_isolated_vertex() {
   std::cout << "--- Test 5: Isolated vertex V(7) ---\n";
 
   graph_t g;
@@ -354,11 +250,13 @@ bool test_isolated_vertex()
 
   bool pass = true;
 
+  // [CHECK] V (id 0) not in the cover
   if (assignments.count(0) == 0 || assignments[0] != false) {
     std::cout << "  FAIL: expected variable 0 = false\n";
     pass = false;
   }
 
+  // [CHECK] empty kernel
   if (count_vertices(g) != 0) {
     std::cout << "  FAIL: expected empty kernel\n";
     pass = false;
@@ -368,28 +266,10 @@ bool test_isolated_vertex()
   return pass;
 }
 
-// --------------------------------------------------
-// TEST 6: Complete bipartite K(2,2)
-//
-//   U1(3) -- V1(5)
-//   U1(3) -- V2(4)
-//   U2(2) -- V1(5)
-//   U2(2) -- V2(4)
-//
-// LP relaxation:
-//   minimize  3·x_U1 + 2·x_U2 + 5·x_V1 + 4·x_V2
-//   subject to all 4 edge constraints
-//
-// Optimal LP: x_U1=1, x_U2=1, x_V1=0, x_V2=0
-//   value = 3 + 2 = 5
-//   (covering both U vertices is cheaper than any V combo)
-//
-// This is unique because the U-side total (5) < V-side total (9).
-//
-// Expected: U1=true, U2=true, V1=false, V2=false
-// --------------------------------------------------
-bool test_complete_bipartite()
-{
+// [TEST6] complete bipartite K(2,2) with U1(3), U2(2) on one side and V1(5), V2(4) on the other
+// LP: the only optimum takes both U vertices (value 5), the U side total 5 is less than the V side total 9
+// expected: U1 = 1, U2 = 1, V1 = 0, V2 = 0, empty kernel
+bool test_complete_bipartite() {
   std::cout << "--- Test 6: K(2,2): U1(3),U2(2) -- V1(5),V2(4) ---\n";
 
   graph_t g;
@@ -411,7 +291,7 @@ bool test_complete_bipartite()
 
   bool pass = true;
 
-  // U1=true, U2=true, V1=false, V2=false
+  // [CHECK] U1 = 1, U2 = 1, V1 = 0, V2 = 0
   bool expected[] = {true, true, false, false};
   for (int id = 0; id <= 3; ++id) {
     if (assignments.count(id) == 0 || assignments[id] != expected[id]) {
@@ -421,6 +301,7 @@ bool test_complete_bipartite()
     }
   }
 
+  // [CHECK] empty kernel
   if (count_vertices(g) != 0) {
     std::cout << "  FAIL: expected empty kernel\n";
     pass = false;
@@ -430,11 +311,8 @@ bool test_complete_bipartite()
   return pass;
 }
 
-// --------------------------------------------------
-// MAIN
-// --------------------------------------------------
-int main()
-{
+// [MAIN] runs the 6 tests and prints the count that passed
+int main() {
   std::cout << "--------------------------------------------------\n";
   std::cout << "  KernelizerMaxflow Verification Tests\n";
   std::cout << "  (CPU static max-flow solver, cap_t=double)\n";

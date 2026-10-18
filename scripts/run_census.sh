@@ -1,98 +1,97 @@
 #!/usr/bin/env bash
+# run_census.sh
+# finds the true largest constraint arity of every instance, read from the parsed instance, the CCG is never built
+# how: e2e_solve is run with --max-arity -1, it parses the file, records graph.max_arity and then refuses it with code 6
+# a file the loader refuses (a non Boolean or a domain-1 variable) gets NA and code 5, collapse those first with run_collapse_audit.sh
 #
-# run_census.sh -- measure the TRUE maximum constraint arity of every instance, from the parsed instance, without ever building the CCG
+# usage: ./scripts/run_census.sh [options] [evalgm|uai|DIR]      (default evalgm)
+#   evalgm               every .wcsp under <artifact>/evalgm
+#   uai                  every .uai under <artifact>/uai
+#   DIR                  every .wcsp and .uai under any folder, for example ~/mtp/wcsp-maxflow/collapsed
+#   --artifact DIR       the local benchmark copy                (default ~/mtp/wcsp-maxflow/artifact)
+#   -n, --name LABEL     word added to the file names
 #
-# Method: e2e_solve prints "[graph] max arity : N" from the parsed constraints BEFORE its arity guard runs
-# With --max-arity -1 the guard then refuses everything, so the program parses, reports, and exits 6
-# Nothing heavy runs and nothing crash
-# Instances the loader refuses (non-Boolean or domain-1 variables) report NA with rc 5 -- collapse those first if just wanted their arity
-#
-set -uo pipefail
-. "$(dirname "$0")/lib/common.sh"
+# output in results/<date>/:
+#   census_<set>_<time>[_label].log   readable log with the largest arity per family
+#   census_<set>_<time>[_label].tsv   instance, family, max_arity, rc (same columns as data/artifact/arity-evalgm.tsv)
+#   census_<set>_<time>[_label]/      the e2e_solve output of every file
+# to update the record in git, copy the tsv over data/artifact/arity-<set>.tsv
 
-ART=~/mtp/wcsp-maxflow/artifact
-SET="evalgm"
-OUTTSV=""
+set -u
+cd "$(dirname "$0")/.." || exit 1
 
-usage() {
-cat <<'USAGE'
-Usage: ./scripts/run_census.sh [options] [set]
-
-Sets:
-  evalgm     every .wcsp under <artifact>/evalgm          (default)
-  uai        every .uai under <artifact>/uai
-  <dir>      any directory: every .wcsp/.uai below it
-
-Options:
-  -o, --out FILE       output table (default: data/artifact/arity-<set>.tsv)
-      --artifact DIR   default: ~/mtp/wcsp-maxflow/artifact
-  -h, --help
-
-Examples:
-  ./scripts/run_census.sh evalgm
-  ./scripts/run_census.sh ~/mtp/wcsp-maxflow/collapsed
-USAGE
-}
-
+# [ARGS] defaults and command line
+art=~/mtp/wcsp-maxflow/artifact
+set_name="evalgm"
+label=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    -o|--out)      OUTTSV="$2"; shift 2 ;;
-    --artifact)    ART="$2"; shift 2 ;;
-    -h|--help)     usage; exit 0 ;;
-    -*)            echo "unknown option: $1" >&2; usage; exit 2 ;;
-    *)             SET="$1"; shift ;;
+    --artifact) art="$2"; shift 2 ;;
+    -n|--name) label="_$2"; shift 2 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -*) echo "unknown option: $1 (see --help)"; exit 1 ;;
+    *) set_name="$1"; shift ;;
   esac
 done
 
-case "$SET" in
-  evalgm) LIST=$(find "$ART/evalgm" -name '*.wcsp' | sort); SETNAME=evalgm ;;
-  uai)    LIST=$(find "$ART/uai" -name '*.uai' | sort); SETNAME=uai ;;
-  *)      if [ -d "$SET" ]; then
-            LIST=$(find "$SET" \( -name '*.wcsp' -o -name '*.uai' \) | sort)
-            SETNAME="$(basename "$SET")"
-          else
-            echo "unknown set: $SET" >&2; exit 2
-          fi ;;
+# [INSTANCES] the files of the set, in sorted order
+case "$set_name" in
+  evalgm) dir="$art/evalgm"; tag=evalgm; pattern='*.wcsp' ;;
+  uai) dir="$art/uai"; tag=uai; pattern='*.uai' ;;
+  *) dir="$set_name"; tag=$(basename "$set_name"); pattern='' ;;
 esac
+if [ ! -d "$dir" ]; then
+  echo "folder not found: $dir"
+  exit 1
+fi
+if [ -n "$pattern" ]; then
+  mapfile -t files < <(find "$dir" -name "$pattern" | sort)
+else
+  mapfile -t files < <(find "$dir" \( -name '*.wcsp' -o -name '*.uai' \) | sort)
+fi
+if [ ! -x ./e2e_solve ]; then
+  echo "./e2e_solve not found, run ./scripts/build.sh core first"
+  exit 1
+fi
 
-mf_init "census_${SETNAME}"
-[ -z "$OUTTSV" ] && OUTTSV="data/artifact/arity-${SETNAME}.tsv"
-mkdir -p "$(dirname "$OUTTSV")"
+# [FILES] names of the output files of this run
+stamp="census_${tag}_$(date +%H%M%S)${label}"
+out_dir="results/$(date +%F)"
+raw_dir="$out_dir/$stamp"
+log="$out_dir/$stamp.log"
+tsv="$out_dir/$stamp.tsv"
+mkdir -p "$raw_dir"
 
-[ -x ./e2e_solve ] || { say "error: ./e2e_solve not built (run ./scripts/run_study.sh build)"; exit 2; }
+say() {
+  echo "$*" | tee -a "$log"
+}
 
-total=$(printf '%s\n' "$LIST" | grep -c .)
-say "set    : $SETNAME   files: $total"
-say "table  : $OUTTSV"
+say "census $(date '+%F %T')  commit $(git rev-parse --short HEAD)  branch $(git rev-parse --abbrev-ref HEAD)"
+say "set $tag  folder $dir  files ${#files[@]}"
 
-printf 'instance\tfamily\tmax_arity\trc\n' > "$OUTTSV"
-legend_for "$OUTTSV" <<'EOF'
-instance    file name without extension
-family      parent folder of the instance
-max_arity   TRUE maximum constraint arity, measured on the parsed instance (largest number of variables in any single constraint); NA when the loader refused the file before measuring
-rc          exit code of the probe:
-              6 = arity measured, then refused by the --max-arity -1 guard (this is the EXPECTED code for a successful measurement)
-              5 = loader refused: a non-Boolean or domain-1 variable; run wcsp_collapse first if the file is domain-1
-              2 = file could not be opened
-EOF
-
+# [RUN] one probe per file, the arity comes from the [m] graph.max_arity line
+printf 'instance\tfamily\tmax_arity\trc\n' > "$tsv"
 i=0
-printf '%s\n' "$LIST" | while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  i=$((i+1))
-  o=$(./e2e_solve --kernelizer none --solver none --max-arity -1 "$f" 2>&1); rc=$?
-  a=$(printf '%s\n' "$o" | sed -n 's/^\[graph\] max arity *: *\([0-9][0-9]*\).*/\1/p' | head -1)
-  b=$(basename "$f"); b="${b%.uai}"; b="${b%.wcsp}"
-  printf '%s\t%s\t%s\t%s\n' "$b" "$(basename "$(dirname "$f")")" "${a:-NA}" "$rc" >> "$OUTTSV"
-  [ $((i % 200)) -eq 0 ] && say "  ...$i/$total"
+for f in "${files[@]}"; do
+  i=$((i + 1))
+  name=$(basename "$f")
+  name="${name%.*}"
+  family=$(basename "$(dirname "$f")")
+  raw="$raw_dir/${family}__$name.out"
+  ./e2e_solve --kernelizer none --solver none --max-arity -1 "$f" > "$raw" 2>&1 < /dev/null
+  rc=$?
+  arity=$(sed -n 's/^\[m\] graph.max_arity : //p' "$raw" | head -1)
+  printf '%s\t%s\t%s\t%s\n' "$name" "$family" "${arity:-NA}" "$rc" >> "$tsv"
+  [ $((i % 200)) -eq 0 ] && say "  $i / ${#files[@]}"
 done
 
+# [SUMMARY] largest arity per family and the count of every exit code
 say ""
-say "=== true max arity per family (measured instances only) ==="
-awk -F'\t' 'NR>1 && $3!="NA" {if($3+0>m[$2]) m[$2]=$3+0; n[$2]++}
-  END{for(k in m) printf "  %6d  %-26s (%d instances)\n", m[k], k, n[k]}' "$OUTTSV" | sort -rn | tee -a "$RUNLOG"
+say "largest arity per family (measured files only)"
+awk -F'\t' 'NR > 1 && $3 != "NA" { if ($3 + 0 > m[$2]) m[$2] = $3 + 0; n[$2]++ }
+  END { for (k in m) printf "  %6d  %-26s %d files\n", m[k], k, n[k] }' "$tsv" | sort -rn | tee -a "$log"
 say ""
-say "=== probe outcomes ==="
-awk -F'\t' 'NR>1 {c[$4]++} END{for(k in c) printf "  rc %-3s %6d\n", k, c[k]}' "$OUTTSV" | tee -a "$RUNLOG"
+say "exit codes (6 = measured, 5 = refused by the loader, 2 = file not readable)"
+awk -F'\t' 'NR > 1 { c[$4]++ } END { for (k in c) printf "  rc %-3s %6d\n", k, c[k] }' "$tsv" | sort | tee -a "$log"
 say ""
-say "done. table: $OUTTSV  (commit it -- it describes the benchmark)"
+say "files  $log  $tsv  $raw_dir/"

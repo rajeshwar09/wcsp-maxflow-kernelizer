@@ -1,0 +1,7 @@
+data/bench/01_10.wcsp	10
+data/bench/02_500.wcsp	500
+data/bench/05_50k.wcsp	50000
+data/bench/06_300k.wcsp	300000
+data/bench/08_500k.wcsp	500000
+data/wcsp/03_100k.wcsp	100000
+data/bench/10_1M.wcsp	1000000

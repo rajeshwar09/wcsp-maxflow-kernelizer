@@ -1,12 +1,14 @@
-// Runs BOTH kernelizers on the same CCG built from one .wcsp file, then compares the resulting assignments variable by variable
+// gate test: runs the max-flow kernelizer and the Gurobi LP kernelizer on the same CCG from one .wcsp file
+// and compares their assignments variable by variable, the two may decide a different number of variables
+// (the LP can have more than one optimum) but must never give a variable opposite values
 //
-// Usage:
-//   ./compare_kernels <file.wcsp>              both kernelizers, one process
-//   ./compare_kernels mf  <file.wcsp> <out>    max-flow only, dump assignments
-//   ./compare_kernels lp  <file.wcsp> <out>    Gurobi only, dump assignments
-//   ./compare_kernels cmp <a> <b>              compare two dumps (a=mf, b=lp)
-//
-// For anything at 300k or above, prefer the split form:
+// build: needs Gurobi, made by ./scripts/build.sh gates
+// usage:
+//   ./compare_kernels <file.wcsp>              both kernelizers in one process
+//   ./compare_kernels mf  <file.wcsp> <out>    max-flow only, writes the assignments to a file
+//   ./compare_kernels lp  <file.wcsp> <out>    Gurobi only, writes the assignments to a file
+//   ./compare_kernels cmp <a> <b>              compares two such files (a = max-flow, b = Gurobi)
+// for 300k variables or more use the split form so only one CCG is in memory at a time:
 //   ./compare_kernels mf data/bench/10_1M.wcsp /tmp/mf.txt
 //   ./compare_kernels lp data/bench/10_1M.wcsp /tmp/lp.txt
 //   ./compare_kernels cmp /tmp/mf.txt /tmp/lp.txt
@@ -27,10 +29,8 @@
 typedef ConstraintCompositeGraph<>::variable_id_t vid_t;
 typedef ConstraintCompositeGraph<>::graph_t graph_t;
 
-//  Build the CCG. The copy out of ConstraintCompositeGraph is unavoidable --
-//  getGraph() returns a const pointer and kernelize() needs a mutable graph --
-//  so this transiently holds two CCGs. Keep it inside as tight a scope as
-//  possible at the call site.
+// [CCG] builds the CCG of the file, the graph has to be copied (getGraph gives a const pointer and kernelize changes the graph),
+// so for a short time two CCGs are in memory, keep the call inside a small scope
 static void build(const char* path, graph_t& g, std::map<vid_t, bool>& pre) {
   std::ifstream in(path);
   if (!in) { std::cerr << "cannot open " << path << "\n"; std::exit(2); }
@@ -43,7 +43,7 @@ static void build(const char* path, graph_t& g, std::map<vid_t, bool>& pre) {
   g = *ccg.getGraph();
 }
 
-//  Run the max-flow kernelizer and release the CCG before returning.
+// [RUN] max-flow kernelizer, the CCG is freed before returning
 static void run_maxflow(const char* path, std::map<vid_t, bool>& out) {
   graph_t g;
   std::map<vid_t, bool> pre;
@@ -55,7 +55,7 @@ static void run_maxflow(const char* path, std::map<vid_t, bool>& out) {
   graph_t().swap(g);
 }
 
-//  Run the LP kernelizer and release the CCG before returning.
+// [RUN] Gurobi LP kernelizer, the CCG is freed before returning
 static void run_gurobi(const char* path, std::map<vid_t, bool>& out) {
   graph_t g;
   std::map<vid_t, bool> pre;
@@ -67,6 +67,7 @@ static void run_gurobi(const char* path, std::map<vid_t, bool>& out) {
   graph_t().swap(g);
 }
 
+// [FILE] writes "variable value" lines
 static void dump(const std::map<vid_t, bool>& m, const char* path) {
   std::ofstream o(path);
   if (!o) { std::cerr << "cannot write " << path << "\n"; std::exit(2); }
@@ -74,6 +75,7 @@ static void dump(const std::map<vid_t, bool>& m, const char* path) {
   std::cerr << "wrote " << m.size() << " assignments to " << path << "\n";
 }
 
+// [FILE] reads a file written by dump
 static void load(const char* path, std::map<vid_t, bool>& m) {
   std::ifstream in(path);
   if (!in) { std::cerr << "cannot open " << path << "\n"; std::exit(2); }
@@ -81,6 +83,7 @@ static void load(const char* path, std::map<vid_t, bool>& m) {
   while (in >> v >> b) m[static_cast<vid_t>(v)] = (b != 0);
 }
 
+// [COMPARE] counts variables decided by one side only, by both with the same value, and by both with opposite values
 static void compare(const std::map<vid_t, bool>& a_mf,
                     const std::map<vid_t, bool>& a_lp,
                     const char* label) {
@@ -110,6 +113,7 @@ static void compare(const std::map<vid_t, bool>& a_mf,
 }
 
 int main(int argc, char** argv) {
+  // [ARGS] split form: mf, lp or cmp
   if (argc >= 4 && std::strcmp(argv[1], "mf") == 0) {
     std::map<vid_t, bool> a;
     run_maxflow(argv[2], a);
@@ -137,8 +141,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  //  Single-process mode. Each CCG is destroyed before the next is built, so
-  //  peak memory is one CCG plus whichever solver structure is larger.
+  // [RUN] one process mode, each CCG is freed before the next one is built, so the peak memory is one CCG plus the larger of the two solvers
   std::map<vid_t, bool> a_mf, a_lp;
   run_maxflow(argv[1], a_mf);
   std::cerr << "  [max-flow stage done: " << a_mf.size() << " decided]\n";

@@ -1,5 +1,5 @@
-# benchmark suite manifest
-# name  N  M  seed  arity  sha256(16)  bytes
+# bench suite manifest, made by scripts/gen_benchmark_suite.sh
+# name  variables  constraints  seed  arity  sha256(16)  bytes
 01_10                    10       15   1001 mixed     f463be34b9eaefcb 1196
 02_500                  500      750   1002 mixed     3371cd8d8d92a2a5 75102
 03_1k                  1000     1500   1003 mixed     4fb5074db698fdd2 154657
@@ -11,3 +11,4 @@
 09_500k_pairwise     500000   750000   1009 pairwise  cb134f6a86209ca5 33939338
 10_1M               1000000  1500000   1010 mixed     caa934ca46b366dc 167666632
 11_1M_pairwise      1000000  1500000   1011 pairwise  ee27ecd97727612b 68212831
+12_1_3M             1300000  1950000   1013 mixed     3ce9b62f873f6507 219646268

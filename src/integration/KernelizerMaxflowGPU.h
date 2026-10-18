@@ -1,252 +1,83 @@
+// same kernelizer as KernelizerMaxflow, only the max-flow runs on the GPU (worklist solver)
+// usage:
+//   maxflow::KernelizerMaxflowGPU<> k(perturb_cfg);
+//   k.kernelize(ccg_graph, assignments);
+
 #ifndef MAXFLOW_KERNELIZER_MAXFLOW_GPU_H
 #define MAXFLOW_KERNELIZER_MAXFLOW_GPU_H
 
-//  KernelizerMaxflowGPU - NT kernelization using GPU max-flow on bipartite double-cover graph
-//
-//  Identical to KernelizerMaxflow except the max-flow solve runs on the GPU (gpu_topology_solver)
-//
-//  The bipartite double-cover construction, index mapping, NT classification,
-//  and graph modification are byte-for-byte the same as the CPU version
-//  Only the solver backend differs.
-
-#include <cmath>
 #include <map>
 #include <vector>
-#include <limits>
 
-#include <boost/graph/adjacency_list.hpp>
-#include <boost/graph/graph_traits.hpp>
-
-#include "third_party/wcsp-solver/src/Kernelizer.h"
-#include "third_party/wcsp-solver/src/ConstraintCompositeGraph.h"
-
-#include "src/common/types.h"
-#include "src/cpu/graph_csr.h"
-#include "src/integration/perturbation.h"
-#include "src/common/stage_timer.h"
-
-#include "src/gpu/maxflow_gpu_topology.h"
 #include "src/gpu/maxflow_gpu_worklist.h"
+#include "src/integration/KernelizerMaxflow.h"
 
 namespace maxflow {
-
-  //  KernelizerMaxflowGPU class
-  //
-  //  Template parameter CCG matches the base class Kernelizer<CCG>
-  //  Taking default as ConstraintCompositeGraph<> which is same as used in LP
-  //
-  //  This uses the GPU topology-driven static max-flow solver
 
   template <class CCG = ConstraintCompositeGraph<>>
   class KernelizerMaxflowGPU : public Kernelizer<CCG> {
     public:
-      KernelizerMaxflowGPU() : pcfg_() {}
-      explicit KernelizerMaxflowGPU(const perturb_config& cfg) : pcfg_(cfg) {}
+      KernelizerMaxflowGPU() : pcfg() {}
+      explicit KernelizerMaxflowGPU(const perturb_config& cfg) : pcfg(cfg) {}
 
-      //  kernelize()
-      //
-      //  Same signature as KernelizerMaxflow::kernelize() and KernelizerLinearProgramming::kernelize()
-      //
-      //  Input:
-      //    g - CCG graph (Boost adjacency_list, undirected, vertex_name=variable_id, vertex_weight=weight)
-      //
-      //  Output:
-      //    out - map from variable_id to bool (true=in cover, false=not in cover, 0.5=variables left in kernel)
-
+      // [KERNELIZE] one round, the caller repeats it until nothing new is decided
       virtual void kernelize(typename CCG::graph_t& g, std::map<typename CCG::variable_id_t, bool>& out) {
         using namespace boost;
-
-        //  Type aliases from CCG
         typedef typename CCG::graph_t graph_t;
         typedef typename graph_traits<graph_t>::vertex_descriptor vertex_t;
-        typedef typename CCG::weight_t weight_t;
-        typedef typename CCG::variable_id_t variable_id_t;
 
-        //  Property maps for vertex_name (variable ID) and vertex_weight (weight)
-        auto vertex_id_map = get(vertex_name, g);
-        auto vertex_weight_map = get(vertex_weight, g);
+        double t = now_sec();
 
-        double _t = stage_now();
-    
-        //  1 : Collect CCG vertices and build index mapping
-        //
-        //  Flow network vertex layout (bipartite double-cover):
-        //    0 = source (s)
-        //    1 .. n = left copies  (vertex i maps to flow ID i+1)
-        //    n+1 .. 2n = right copies (vertex i maps to flow ID n+i+1)
-        //    2n+1 = sink (t)
-        //  Total vertices in flow network = 2n + 2
-
+        // [COLLECT] integer index for every CCG vertex
         std::vector<vertex_t> ccg_vertices;
         std::map<vertex_t, int> vertex_index;
-
         typename graph_traits<graph_t>::vertex_iterator vi, vi_end;
-        std::tie(vi, vi_end) = vertices(g);
-        for (auto it = vi; it != vi_end; it++) {
-          vertex_index[*it] = static_cast<int>(ccg_vertices.size());
-          ccg_vertices.push_back(*it);
+        for (std::tie(vi, vi_end) = vertices(g); vi != vi_end; ++vi) {
+          vertex_index[*vi] = static_cast<int>(ccg_vertices.size());
+          ccg_vertices.push_back(*vi);
         }
-
         int n = static_cast<int>(ccg_vertices.size());
-
-        _t = stage_mark("kern.collect", _t);
-
-        //  Edge case : if the graph is empty, nothing to kernelize
+        t = mark("time.kern.collect", t);
         if (n == 0) {
           return;
         }
 
-        //  2 : Build bipartite double-cover flow network    
-
-        int flow_n = 2 * n + 2;             //  total flow-network vertices
-        vertex_id_t flow_source = 0;        //  source ID
-        vertex_id_t flow_sink = 2 * n + 1;  //  sink ID
-
-        //  Tie-breaking perturbation -- identical to the CPU path, including the integral-weight guard. Keeping these in step is what makes the CPU and GPU kernels comparable
-        cap_t total_w = cap_t(0);
-        bool  w_integral = true;
-        for (int i = 0; i < n; i++) {
-          cap_t w = static_cast<cap_t>(vertex_weight_map[ccg_vertices[i]]);
-          total_w += w;
-          if (!is_integral(w)) w_integral = false;
-        }
-
-        perturber pert(pcfg_, n, total_w, w_integral);
-
-        //  Compute INF = 1 + sum of all (perturbed) weights
-        std::vector<cap_t> weights(n);
-        cap_t inf_cap = cap_t(1);
-        for (int i = 0; i < n; i++) {
-          weights[i] = pert.weight(i, static_cast<cap_t>(vertex_weight_map[ccg_vertices[i]]));
-          inf_cap += weights[i];
-        }
-
-        //  collect directed edges from flow network
-        std::vector<edge<cap_t>> flow_edges;
-        flow_edges.reserve(2 * n + 4 * n);
-
-        //  source and sink edges (1 per CCG vertex)
-        for (int i = 0; i < n; i++) {
-          cap_t w = weights[i];
-
-          int left_copy = i + 1;
-          int right_copy = n + i + 1;
-
-          //  source -> left copy, capacity = vertex weight
-          flow_edges.push_back({flow_source, left_copy, w});
-
-          //  right copy -> sink, capacity = vertex weight
-          flow_edges.push_back({right_copy, flow_sink, w});
-        }
-
-        //  cross edges (1 pair per CCG edge)
-        typename graph_traits<graph_t>::edge_iterator ei, ei_end;
-        std::tie(ei, ei_end) = edges(g);
-        for (auto it = ei; it != ei_end; it++) {
-          vertex_t u_desc = source(*it, g);
-          vertex_t v_desc = target(*it, g);
-
-          int u_idx = vertex_index[u_desc];
-          int v_idx = vertex_index[v_desc];
-
-          int u_left = u_idx + 1;
-          int v_left = v_idx + 1;
-          int u_right = n + u_idx + 1;
-          int v_right = n + v_idx + 1;
-
-          //  left copy of u -> right copy of v, capacity = INF
-          flow_edges.push_back({u_left, v_right, inf_cap});
-
-          //  left copy of v -> right copy of u, capacity = INF
-          flow_edges.push_back({v_left, u_right, inf_cap});
-        }
-
-        //  build Bi-CSR flow network from edge list
+        // [DOUBLE-COVER] same network as the CPU kernelizer
         flow_network<cap_t> net;
-        net.build_from_edges(flow_n, flow_source, flow_sink, flow_edges);
+        build_double_cover<CCG>(g, ccg_vertices, vertex_index, pcfg, net);
+        t = mark("time.kern.build_flownet", t);
 
-        _t = stage_mark("kern.build_flownet", _t);
-        
-        //  3 : Solve max-flow ON THE GPU
-
-        //  Which GPU scheduling strategy to use. Both solvers run the same algorithm and return the same min-cut; they differ only in how many threads they launch per pass
-        //    MAXFLOW_GPU=worklist   one thread per ACTIVE vertex ( default)
-        //    MAXFLOW_GPU=topology   one thread per VERTEX, every pass
-
+        // [MAXFLOW] GPU worklist solver, the source side is copied out before the solver is freed
         std::vector<char> source_side(net.num_nodes, 0);
         {
-          const char* env_gpu = std::getenv("MAXFLOW_GPU");
-          const bool use_worklist = !(env_gpu != nullptr && std::string(env_gpu) == "topology");
-          if (use_worklist) {
-            gpu_worklist_solver solver(net);
-            solver.solve();
-            for (int v = 0; v < net.num_nodes; v++) {
-              source_side[v] = solver.is_on_source_side(v) ? 1 : 0;
-            }
-          } else {
-            gpu_topology_solver solver(net);
-            solver.solve();
-            for (int v = 0; v < net.num_nodes; v++) {
-              source_side[v] = solver.is_on_source_side(v) ? 1 : 0;
-            }
+          gpu_worklist_solver solver(net);
+          solver.solve();
+          for (int v = 0; v < net.num_nodes; v++) {
+            source_side[v] = solver.is_on_source_side(v) ? 1 : 0;
           }
         }
+        t = mark("time.kern.maxflow", t);
 
-        _t = stage_mark("kern.maxflow", _t);
-
-        //  4 : Extract NT classification from min-cut    
-        //
-        //  Classification:
-        //    L on source, R on sink   -> x = 0 (NOT in cover)
-        //    L on sink,   R on source -> x = 1 (IN cover)
-        //    both same side           -> x = 0.5 (undecided, keep)
-
-        // 0 = not in cover, 1 = in cover, 2 = undecided (0.5)
-        std::vector<int> classification(n, 2);
-
+        // [CLASSIFY] side of the left and right copy of every vertex
+        std::vector<int> side(n, 2);
         for (int i = 0; i < n; i++) {
-          bool left_source = source_side[i + 1] != 0;
-          bool right_source = source_side[n + i + 1] != 0;
-
-          if (left_source && !right_source) {
-            classification[i] = 0;
-          } else if (!left_source && right_source) {
-            classification[i] = 1;
+          bool left_src = source_side[i + 1] != 0;
+          bool right_src = source_side[n + i + 1] != 0;
+          if (left_src && !right_src) {
+            side[i] = 0;
+          } else if (!left_src && right_src) {
+            side[i] = 1;
           }
-          //  else: both on same side => x = 0.5, keep as 2
         }
+        t = mark("time.kern.classify", t);
 
-        _t = stage_mark("kern.classify", _t);
-
-        //  5 : Modify the CCG graph    
-
-        for (int i = 0; i < n; i++) {
-          if (classification[i] == 2) {
-            continue;  //  x = 0.5 => undecided, keep it
-          }
-
-          vertex_t v = ccg_vertices[i];
-          auto id = vertex_id_map[v];
-
-          if (classification[i] == 1) {
-            if (id >= 0) {
-              out[id] = true;
-            }
-          } else {
-            if (id >= 0) {
-              out[id] = false;
-            }
-          }
-
-          clear_vertex(v, g);
-          remove_vertex(v, g);
-        }
-
-        stage_mark("kern.apply", _t);
+        // [APPLY] update the CCG
+        apply_classification<CCG>(g, ccg_vertices, side, out);
+        mark("time.kern.apply", t);
       }
 
     private:
-      perturb_config pcfg_;
+      perturb_config pcfg;
   };
 
 } // namespace maxflow

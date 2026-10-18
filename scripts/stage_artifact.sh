@@ -1,175 +1,169 @@
 #!/usr/bin/env bash
+# stage_artifact.sh
+# makes a clean local copy of the published benchmark from the drive, and data/artifact/manifest.tsv that says what every file is
+# steps:
+#   1. finds the evalgm/ and uai/ folders under --source (up to 4 levels deep)
+#   2. reads the header of every .wcsp and .uai and puts it in a class
+#        boolean    : every domain is 2               -> copied, usable directly
+#        domain1    : domains are only 1 and 2        -> copied, usable after wcsp_collapse
+#        multi      : some domain is 3 or more        -> not copied, no CCG method can use it
+#        unreadable : the header could not be read    -> not copied
+#   3. writes data/artifact/manifest.tsv
+#   4. copies the usable files into <dest>.staging, with the same folder layout
+#   5. the old --dest folder is renamed to <dest>.old-<date> (never deleted) and the staging folder becomes --dest
 #
-# stage_artifact.sh -- build a CLEAN local copy of the published benchmark from the mounted drive, with a manifest file that records what every file is and why it was copied or left behind
-#
-# File working:
-#   1. finds the evalgm/ and uai/ trees under --source
-#   2. reads the header of every .wcsp and .uai and classifies it:
-#        boolean    every variable has domain size 2      -> COPIED (usable)
-#        domain1    domains are only 1 and 2              -> COPIED (recoverable via wcsp_collapse)
-#        multi      some variable has domain size >= 3    -> left on the drive (no CCG method can express it)
-#        unreadable header could not be parsed            -> left on the drive
-#   3. writes the manifest to data/artifact/manifest.tsv
-#   4. copies the keepers into a staging folder, preserving relative paths
-#   5. swaps: the old --dest is RENAMED to <dest>.old-<date> (never deleted), the staging folder becomes the new --dest
-#
-#
-set -uo pipefail
-. "$(dirname "$0")/lib/common.sh"
+# usage: ./scripts/stage_artifact.sh --source DIR [--dest DIR] [--dry-run]
+#   --source DIR   where the drive is mounted, for example /run/media/raje/D8881E91881E6DEE
+#   --dest DIR     the local copy                    (default ~/mtp/wcsp-maxflow/artifact)
+#   --dry-run      only classify and write the manifest, nothing is copied or renamed
+# the log goes to results/<date>/stage_artifact_<time>.log
+# manifest columns: relpath, collection, family, format, nvars, class, copied, bytes (see data/artifact/manifest.legend.txt)
 
-SRC=""
-DEST=~/mtp/wcsp-maxflow/artifact
-DRYRUN=0
+set -u
+cd "$(dirname "$0")/.." || exit 1
 
-usage() {
-cat <<'USAGE'
-Usage: ./scripts/stage_artifact.sh --source <mounted-drive-dir> [options]
-
-Options:
-  --source DIR    where the drive is mounted (REQUIRED); the script finds the evalgm/ and uai/ folders anywhere up to 4 levels below it
-  --dest DIR      where the local copy lives (default: ~/mtp/wcsp-maxflow/artifact)
-  --dry-run       classify and write the manifest only; copy nothing, swap nothing
-  -h, --help
-
-Example:
-  ./scripts/stage_artifact.sh --source /run/media/raje/<DRIVE>/experiments --dry-run
-  ./scripts/stage_artifact.sh --source /run/media/raje/<DRIVE>/experiments
-USAGE
-}
-
+# [ARGS] defaults and command line
+src=""
+dest=~/mtp/wcsp-maxflow/artifact
+dry_run=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --source)  SRC="$2"; shift 2 ;;
-    --dest)    DEST="$2"; shift 2 ;;
-    --dry-run) DRYRUN=1; shift ;;
-    -h|--help) usage; exit 0 ;;
-    *)         echo "unknown option: $1" >&2; usage; exit 2 ;;
+    --source) src="$2"; shift 2 ;;
+    --dest) dest="$2"; shift 2 ;;
+    --dry-run) dry_run=1; shift ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1 (see --help)"; exit 1 ;;
   esac
 done
-[ -n "$SRC" ] || { echo "error: --source is required" >&2; usage; exit 2; }
-[ -d "$SRC" ] || { echo "error: source '$SRC' is not a directory (drive mounted?)" >&2; exit 2; }
+if [ -z "$src" ]; then
+  echo "--source is needed (see --help)"
+  exit 1
+fi
+if [ ! -d "$src" ]; then
+  echo "source not found: $src (is the drive mounted?)"
+  exit 1
+fi
 
-mf_init "stage_artifact"
-mkdir -p data/artifact
+# [LOG] one log file per run
+mkdir -p "results/$(date +%F)" data/artifact
+log="results/$(date +%F)/stage_artifact_$(date +%H%M%S).log"
+say() {
+  echo "$*" | tee -a "$log"
+}
 
-# ------------------------------------------------- find the collection roots
+# [FIND] the two collection folders on the drive
+evalgm_root=$(find "$src" -maxdepth 4 -type d -name evalgm 2>/dev/null | head -1)
+uai_root=$(find "$src" -maxdepth 4 -type d \( -name uai -o -name uai-instances \) 2>/dev/null | head -1)
+say "stage artifact $(date '+%F %T')  commit $(git rev-parse --short HEAD)  dry_run $dry_run"
+say "source $src"
+say "evalgm ${evalgm_root:-not found}"
+say "uai    ${uai_root:-not found}"
+say "dest   $dest"
+if [ -z "$evalgm_root" ] && [ -z "$uai_root" ]; then
+  say "nothing to stage"
+  exit 1
+fi
 
-EVALGM_ROOT="$(find "$SRC" -maxdepth 4 -type d -name evalgm 2>/dev/null | head -1)"
-UAI_ROOT="$(find "$SRC" -maxdepth 4 -type d \( -name uai -o -name uai-instances \) 2>/dev/null | head -1)"
-say "source          : $SRC"
-say "evalgm found at : ${EVALGM_ROOT:-NOT FOUND}"
-say "uai found at    : ${UAI_ROOT:-NOT FOUND}"
-say "dest            : $DEST"
-[ -z "$EVALGM_ROOT" ] && [ -z "$UAI_ROOT" ] && { say "nothing to stage."; exit 2; }
+manifest=data/artifact/manifest.tsv
+printf 'relpath\tcollection\tfamily\tformat\tnvars\tclass\tcopied\tbytes\n' > "$manifest"
 
-MANIFEST="data/artifact/manifest.tsv"
-printf 'relpath\tcollection\tfamily\tformat\tnvars\tclass\tcopied\tbytes\n' > "$MANIFEST"
-legend_for "$MANIFEST" <<'EOF'
-relpath     path of the file relative to the new artifact folder
-collection  evalgm or uai
-family      parent folder of the instance (e.g. Auction, DBN, MMAP)
-format      wcsp (DIMACS) or uai
-nvars       number of variables declared in the header
-class       boolean    every domain is 2            -> usable directly
-            domain1    domains are only 1 and 2     -> usable after wcsp_collapse
-            multi      some domain is >= 3          -> unusable for ANY CCG method
-            unreadable the header did not parse
-copied      yes = present in the local artifact copy, no = left on the drive
-bytes       file size in bytes
-EOF
-
-# --------------------------------------------------------------- classifiers
-
-# prints "class<TAB>nvars"
+# [CLASS] .wcsp header: line 1 has the variable count in field 2, line 2 has the domains, prints "class<TAB>nvars"
+# done stops the END block from printing a second line after exit
 classify_wcsp() {
-  awk 'NR==1 { nv=$2; if (nv+0<=0) { print "unreadable\tNA"; exit } next }
-       NR==2 { cls="boolean"
-               for (i=1; i<=NF; i++) {
-                 if ($i+0>=3) { cls="multi"; break }
-                 if ($i+0==1) cls="domain1"
-                 else if ($i+0!=2) { cls="unreadable"; break }
-               }
-               print cls "\t" nv; exit }
-       END   { if (NR<2) print "unreadable\tNA" }' "$1"
+  awk 'NR == 1 { nv = $2; if (nv + 0 <= 0) { print "unreadable\tNA"; done = 1; exit } next }
+       NR == 2 { cls = "boolean"
+                 for (i = 1; i <= NF; i++) {
+                   if ($i + 0 >= 3) { cls = "multi"; break }
+                   if ($i + 0 == 1) cls = "domain1"
+                   else if ($i + 0 != 2) { cls = "unreadable"; break }
+                 }
+                 print cls "\t" nv; done = 1; exit }
+       END { if (!done) print "unreadable\tNA" }' "$1"
 }
 
+# [CLASS] .uai header: line 2 has the variable count, line 3 has the domains
 classify_uai() {
-  awk 'NR==2 { nv=$1+0; if (nv<=0) { print "unreadable\tNA"; exit } }
-       NR==3 { cls="boolean"
-               for (i=1; i<=NF; i++) {
-                 if ($i+0>=3) { cls="multi"; break }
-                 if ($i+0==1) cls="domain1"
-                 else if ($i+0!=2) { cls="unreadable"; break }
-               }
-               print cls "\t" nv; exit }
-       END   { if (NR<3) print "unreadable\tNA" }' "$1"
+  awk 'NR == 2 { nv = $1 + 0; if (nv <= 0) { print "unreadable\tNA"; done = 1; exit } }
+       NR == 3 { cls = "boolean"
+                 for (i = 1; i <= NF; i++) {
+                   if ($i + 0 >= 3) { cls = "multi"; break }
+                   if ($i + 0 == 1) cls = "domain1"
+                   else if ($i + 0 != 2) { cls = "unreadable"; break }
+                 }
+                 print cls "\t" nv; done = 1; exit }
+       END { if (!done) print "unreadable\tNA" }' "$1"
 }
 
-# ------------------------------------------------------------------ stage it
+stage="${dest}.staging"
+rm -rf "$stage"
+[ "$dry_run" = 0 ] && mkdir -p "$stage"
 
-STAGE="${DEST}.staging"
-rm -rf "$STAGE"
-[ "$DRYRUN" = "0" ] && mkdir -p "$STAGE"
-
+# [SCAN] classify every file of one collection, copy the usable ones, add one manifest row each
 scan_collection() {
-  local root="$1" coll="$2" pattern="$3"
+  local root="$1" coll="$2" ext="$3"
   [ -n "$root" ] || return 0
-  local total copied=0 i=0
-  total=$(find "$root" -name "$pattern" -type f | wc -l)
+  local files f rel fam cn cls nv copy i=0
+  mapfile -t files < <(find "$root" -name "*.$ext" -type f | sort)
   say ""
-  say "--- $coll: $total files ---"
-  find "$root" -name "$pattern" -type f | sort | while IFS= read -r f; do
-    i=$((i+1))
-    local rel="${f#"$root"/}"
-    local fam; fam="$(basename "$(dirname "$f")")"
-    local fmt="${pattern#\*.}"
-    local cn cls nv
-    if [ "$fmt" = "wcsp" ]; then cn="$(classify_wcsp "$f")"; else cn="$(classify_uai "$f")"; fi
-    cls="${cn%%	*}"; nv="${cn#*	}"
-    local copy=no
-    case "$cls" in boolean|domain1) copy=yes ;; esac
-    if [ "$copy" = "yes" ] && [ "$DRYRUN" = "0" ]; then
-      mkdir -p "$STAGE/$coll/$(dirname "$rel")"
-      cp "$f" "$STAGE/$coll/$rel"
+  say "$coll: ${#files[@]} files"
+  for f in "${files[@]}"; do
+    i=$((i + 1))
+    rel="${f#"$root"/}"
+    fam=$(basename "$(dirname "$f")")
+    if [ "$ext" = "wcsp" ]; then
+      cn=$(classify_wcsp "$f")
+    else
+      cn=$(classify_uai "$f")
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$coll/$rel" "$coll" "$fam" "$fmt" "$nv" "$cls" "$copy" \
-      "$(stat -c %s "$f" 2>/dev/null)" >> "$MANIFEST"
-    [ $((i % 200)) -eq 0 ] && say "  ...$i/$total"
+    cls="${cn%%$'\t'*}"
+    nv="${cn#*$'\t'}"
+    copy=no
+    case "$cls" in
+      boolean|domain1) copy=yes ;;
+    esac
+    if [ "$copy" = yes ] && [ "$dry_run" = 0 ]; then
+      mkdir -p "$stage/$coll/$(dirname "$rel")"
+      cp "$f" "$stage/$coll/$rel"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$coll/$rel" "$coll" "$fam" "$ext" "$nv" "$cls" "$copy" \
+      "$(stat -c %s "$f" 2>/dev/null)" >> "$manifest"
+    [ $((i % 200)) -eq 0 ] && say "  $i / ${#files[@]}"
   done
 }
 
-scan_collection "$EVALGM_ROOT" evalgm '*.wcsp'
-scan_collection "$UAI_ROOT"    uai    '*.uai'
+scan_collection "$evalgm_root" evalgm wcsp
+scan_collection "$uai_root" uai uai
 
-# ------------------------------------------------------------------ summary
-
+# [SUMMARY] files per class and collection, copied files per family
 say ""
-say "=== manifest summary (class x collection) ==="
-awk -F'\t' 'NR>1 {c[$2" "$6]++; t[$2]++}
-  END{for(k in c) printf "  %-8s %-11s %6d\n", substr(k,1,index(k," ")-1), substr(k,index(k," ")+1), c[k]
-      for(k in t) printf "  %-8s TOTAL       %6d\n", k, t[k]}' "$MANIFEST" | sort | tee -a "$RUNLOG"
+say "class x collection"
+awk -F'\t' 'NR > 1 { c[$2 " " $6]++; t[$2]++ }
+  END { for (k in c) { split(k, p, " "); printf "  %-8s %-11s %6d\n", p[1], p[2], c[k] }
+        for (k in t) printf "  %-8s TOTAL       %6d\n", k, t[k] }' "$manifest" | sort | tee -a "$log"
 say ""
-say "=== copied, per family ==="
-awk -F'\t' 'NR>1 && $7=="yes" {c[$2"/"$3]++} END{for(k in c) printf "  %-32s %5d\n", k, c[k]}' "$MANIFEST" | sort | tee -a "$RUNLOG"
+say "copied, per family"
+awk -F'\t' 'NR > 1 && $7 == "yes" { c[$2 "/" $3]++ } END { for (k in c) printf "  %-32s %5d\n", k, c[k] }' "$manifest" | sort | tee -a "$log"
 
-if [ "$DRYRUN" = "1" ]; then
+if [ "$dry_run" = 1 ]; then
   say ""
-  say "dry run: manifest written to $MANIFEST; the copied column shows the decision that WOULD be taken"
+  say "dry run: only $manifest was written, the copied column shows what would be copied"
+  say "log $log"
   exit 0
 fi
 
-# ---------------------------------------------------------------- the swap
-
-cp "$MANIFEST" "$STAGE/manifest.tsv"
-if [ -d "$DEST" ]; then
-  BAK="${DEST}.old-$(date +%Y-%m-%d)"
-  n=1; while [ -e "$BAK" ]; do BAK="${DEST}.old-$(date +%Y-%m-%d)-$n"; n=$((n+1)); done
-  mv "$DEST" "$BAK"
+# [SWAP] keep the old copy under a new name, then put the new copy in its place
+cp "$manifest" "$stage/manifest.tsv"
+if [ -d "$dest" ]; then
+  bak="${dest}.old-$(date +%F)"
+  n=1
+  while [ -e "$bak" ]; do
+    bak="${dest}.old-$(date +%F)-$n"
+    n=$((n + 1))
+  done
+  mv "$dest" "$bak"
   say ""
-  say "previous artifact folder moved to: $BAK"
+  say "old copy moved to $bak"
 fi
-mv "$STAGE" "$DEST"
-say "new artifact copy is live at: $DEST"
-say ""
-say "done. manifest: $MANIFEST"
+mv "$stage" "$dest"
+say "new copy is at $dest"
+say "manifest $manifest  log $log"

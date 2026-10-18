@@ -1,18 +1,17 @@
-// Audits the min-cut that KernelizerMaxflow actually uses.
+// cut_audit.cpp
+// checks that the cut KernelizerMaxflow uses is a real minimum cut, a gate test for the NT classification
+// builds the same double cover network, solves it with the CPU solver and then looks at several source side choices:
+//   STALE      : the heights as the solver left them (from the BFS at the top of the last loop, before the last push and remove)
+//   FRESH      : a backward BFS from the sink over the final residual graph
+//   SEEDED     : forward residual reachability from the source and from every vertex that still has excess (the rule in use now)
+//   PHASE2-MIN : after the preflow is turned into a real flow, reachable from the source
+//   PHASE2-MAX : after the preflow is turned into a real flow, cannot reach the sink
+// for each one it prints the cut capacity and the residual edges that cross from the source side to the sink side
+// a real min cut has capacity = max-flow and no crossing residual, else the NT classification from it is not justified
+// it also checks that every capacity, residual and excess is a whole number (the integrality audit)
 //
-// Builds the same bipartite double-cover network, solves it with the CPU
-// solver, then evaluates TWO candidate source-side definitions:
-//
-//   STALE : height[] as left by the solver (heights from the BFS at the top of
-//           the last loop iteration, i.e. BEFORE the final push/remove)
-//   FRESH : a backward BFS from the sink over the FINAL residual graph
-//
-// For each it reports the cut capacity and any residual edge crossing from
-// source side to sink side. A genuine min-cut has capacity == max-flow and
-// zero crossing residual. Anything else is not a min-cut, and the NT
-// classification derived from it is not justified.
-//
-// Usage: ./cut_audit <file.wcsp>
+// build: g++ -std=c++17 -O2 -I. apps/cut_audit.cpp -o cut_audit -lopenblas
+// usage: ./cut_audit <file.wcsp>
 
 #include <cmath>
 #include <iostream>
@@ -30,11 +29,11 @@ typedef ConstraintCompositeGraph<>::variable_id_t vid_t;
 typedef ConstraintCompositeGraph<>::graph_t graph_t;
 typedef boost::graph_traits<graph_t>::vertex_descriptor vertex_t;
 
-// Report one candidate partition. src_side[v] != 0 means v is on the source side.
+// [REPORT] prints one source side choice, src_side[v] != 0 means v is on the source side
 static void report(const char* label, const flow_network<cap_t>& net,
                    const std::vector<char>& src_side, cap_t F, int n) {
-  cap_t cap_sum = 0;      // capacity of edges crossing source side -> sink side
-  cap_t leak_amt = 0;     // residual still available across that same boundary
+  cap_t cap_sum = 0;      // capacity of the edges from the source side to the sink side
+  cap_t leak_amt = 0;     // residual still left on those same edges
   long  leak_cnt = 0;
   long  side_sz  = 0;
 
@@ -52,7 +51,7 @@ static void report(const char* label, const flow_network<cap_t>& net,
     }
   }
 
-  // NT classification under this partition
+  // [REPORT] NT classification for this choice
   long dec0 = 0, dec1 = 0, undec = 0;
   for (int i = 0; i < n; i++) {
     bool L = src_side[i + 1] != 0;
@@ -92,7 +91,7 @@ int main(int argc, char** argv) {
 
   std::cout << "pre-resolved by ccg.simplify(): " << pre.size() << "\n\n";
 
-  // --- rebuild the double cover exactly as KernelizerMaxflow does ---
+  // [FLOW] the same double cover network as KernelizerMaxflow builds
   auto vertex_id_map     = boost::get(boost::vertex_name, g);
   auto vertex_weight_map = boost::get(boost::vertex_weight, g);
   (void)vertex_id_map;
@@ -140,7 +139,7 @@ int main(int argc, char** argv) {
   static_max_flow_solver<cap_t> solver(net);
   cap_t F = solver.solve();
 
-  // --- preflow health: excess recomputed from the final residuals ---
+  // [EXCESS] excess of every vertex worked out again from the final residuals
   std::vector<cap_t> ex(flow_n, 0);
   {
     for (vertex_id_t u = 0; u < net.num_nodes; u++)
@@ -159,18 +158,11 @@ int main(int argc, char** argv) {
     std::cout << "net flow out of source = " << -ex[net.source] << "\n\n";
   }
 
-  //  Integrality audit
-  //
-  //  WCSP costs are integers and toPolynomial() is a Mobius transform -- alternating
-  //  sums of integers -- so every double-cover capacity should be integral. By the
-  //  max-flow integrality theorem an integral maximum flow then exists, so every
-  //  residual, the flow value and the cut capacity should also come out as exact
-  //  integers. Any drift here means MAXFLOW_EPSILON is masking numerical error.
-  //  If there is none, cap_t can become int64_t and the epsilon can go away.
-  //
-  //  the 0.5 values NT reports are NOT fractionality in this sense: the
-  //  bipartite cut itself is integral (Koenig / total unimodularity). A 0.5 means
-  //  a variable's two copies landed on the SAME side, which is expected behaviour.
+  // [INTEGRAL] WCSP costs are whole numbers and toPolynomial is a Mobius transform (sums and differences of whole numbers),
+  // so every capacity should be a whole number, then a whole number max flow exists and every residual, the flow value
+  // and the cut capacity should also be exact whole numbers, any drift means MAXFLOW_EPSILON is hiding a rounding error
+  // the 0.5 values of NT are not this kind of fraction, the bipartite cut is integral (Koenig, total unimodularity),
+  // a 0.5 only means the two copies of a variable ended on the same side
   {
     auto frac = [](cap_t x) {
       cap_t r = x - std::floor(x + 0.5);
@@ -190,8 +182,7 @@ int main(int argc, char** argv) {
       if (fe > 1e-9) { ex_bad++; if (fe > ex_worst) ex_worst = fe; }
     }
 
-    //  How many residuals are EXACTLY zero versus merely below the epsilon?
-    //  A saturated edge should be exactly 0 if the arithmetic is clean.
+    // [INTEGRAL] residuals that are exactly 0 against ones only below the epsilon, with clean arithmetic a full edge is exactly 0
     long exact_zero = 0, near_zero = 0;
     for (edge_id_t e = 0; e < net.num_edges; e++) {
       if (net.residual_capacity[e] == cap_t(0)) {
@@ -220,15 +211,15 @@ int main(int argc, char** argv) {
               << "\n\n";
   }
 
-  // --- STALE partition: heights as the solver left them ---
+  // [STALE] heights as the solver left them
   {
     const std::vector<int>& h = solver.heights();
     std::vector<char> side(flow_n, 0);
     for (int v = 0; v < flow_n; v++) side[v] = (h[v] >= flow_n) ? 1 : 0;
-    report("STALE heights (what KernelizerMaxflow uses today)", net, side, F, n);
+    report("STALE heights (old rule)", net, side, F, n);
   }
 
-  // --- FRESH partition: backward BFS from sink over the final residuals ---
+  // [FRESH] backward BFS from the sink over the final residuals
   {
     std::vector<int> h(flow_n, flow_n);
     h[net.sink] = 0;
@@ -250,12 +241,9 @@ int main(int argc, char** argv) {
     report("FRESH backward BFS (what the final relabel computes)", net, side, F, n);
   }
 
-  // --- SEEDED partition: forward residual reachability from the source
-  //     TOGETHER WITH every vertex still holding excess.
-  //     No residual edge leaves this set (it is a reachability closure), and it
-  //     contains the source and all stranded excess, so its capacity equals the
-  //     max-flow. It is the SMALLEST such set, so it decides at least as many
-  //     variables as any other min-cut. ---
+  // [SEEDED] forward residual reachability from the source together with every vertex that still has excess
+  // no residual edge leaves this set (it is closed under reachability) and it holds the source and all stranded excess,
+  // so its capacity equals the max-flow, it is the smallest such set so it decides at least as many variables as any other min cut
   {
     std::vector<char> side(flow_n, 0);
     std::vector<vertex_id_t> stack;
@@ -280,22 +268,15 @@ int main(int argc, char** argv) {
       }
     }
     std::cout << "(SEEDED started from " << seeds << " seed vertices)\n";
-    report("SEEDED fwd BFS from source + excess (proposed fix)", net, side, F, n);
+    report("SEEDED fwd BFS from source + excess (rule in use)", net, side, F, n);
   }
 
-  // ------------------------------------------------------------------
-  //  PHASE 2: convert the preflow into a true flow by returning every unit
-  //  of stranded excess to the source. Lemma 3.5 guarantees a residual path
-  //  v -> s exists for each such v, and those paths lie entirely inside the
-  //  source side, so the cut itself cannot move -- but reachability TO THE
-  //  SINK can change, which is what we are testing.
-  //
-  //  Method: one BFS from s over REVERSED residual edges builds a parent
-  //  pointer toward s for every vertex that can reach s. Drain along those
-  //  parent chains. If a chain edge saturates, rebuild and repeat.
-  //  NOTE: this MUTATES net.residual_capacity, so it must run after the
-  //  STALE / FRESH / SEEDED reports above.
-  // ------------------------------------------------------------------
+  // [PHASE2] turn the preflow into a real flow by sending every unit of stranded excess back to the source
+  // Lemma 3.5 says a residual path v -> s exists for each such v and these paths stay inside the source side,
+  // so the cut cannot move, but reachability to the sink can change and that is what is tested here
+  // how: one BFS from s over reversed residual edges gives every vertex that can reach s a parent pointer towards s,
+  // the excess is drained along these chains, when a chain edge is full the BFS is done again
+  // this changes net.residual_capacity, so it must run after the STALE, FRESH and SEEDED reports
   {
     std::vector<edge_id_t> parent(flow_n, -1);
     std::vector<char> seen(flow_n, 0);
@@ -307,8 +288,7 @@ int main(int argc, char** argv) {
       progress = false;
       rounds++;
 
-      //  BFS from the source over reversed residual edges.
-      //  parent[u] = the half-edge u -> w that u should use to step toward s.
+      // [PHASE2] BFS from the source over reversed residual edges, parent[u] is the half edge u -> w that takes u towards s
       std::fill(parent.begin(), parent.end(), -1);
       std::fill(seen.begin(), seen.end(), 0);
       std::queue<vertex_id_t> q;
@@ -318,7 +298,7 @@ int main(int argc, char** argv) {
         vertex_id_t w = q.front(); q.pop();
         for (edge_id_t e = net.offset[w]; e < net.offset[w + 1]; e++) {
           vertex_id_t u = net.edge_dst[e];
-          edge_id_t back = net.reverse_index[e];   //  the half-edge u -> w
+          edge_id_t back = net.reverse_index[e];   // the half edge u -> w
           if (!seen[u] && net.residual_capacity[back] > MAXFLOW_EPSILON) {
             seen[u] = 1;
             parent[u] = back;
@@ -331,7 +311,7 @@ int main(int argc, char** argv) {
         if (v == net.source || v == net.sink) continue;
         if (ex[v] <= MAXFLOW_EPSILON || !seen[v]) continue;
 
-        //  bottleneck along v -> ... -> s
+        // [PHASE2] smallest residual on the chain from v to s
         cap_t b = ex[v];
         vertex_id_t u = v;
         while (u != net.source && b > MAXFLOW_EPSILON) {
@@ -342,7 +322,7 @@ int main(int argc, char** argv) {
         }
         if (b <= MAXFLOW_EPSILON) continue;
 
-        //  push b units back along the same chain
+        // [PHASE2] send b units back along the same chain
         u = v;
         while (u != net.source) {
           edge_id_t e = parent[u];
@@ -371,7 +351,7 @@ int main(int argc, char** argv) {
     std::cout << "  net flow out of source = " << -ex[net.source]
               << "  (should now equal max-flow " << F << ")\n\n";
 
-    //  PHASE2-MIN : reachable from the source in the residual graph
+    // [PHASE2] MIN side: reachable from the source in the residual graph
     {
       std::vector<char> side(flow_n, 0);
       std::vector<vertex_id_t> stack;
@@ -390,7 +370,7 @@ int main(int argc, char** argv) {
       report("PHASE2-MIN reachable from source (predict: same as SEEDED)", net, side, F, n);
     }
 
-    //  PHASE2-MAX : cannot reach the sink in the residual graph
+    // [PHASE2] MAX side: cannot reach the sink in the residual graph
     {
       std::vector<int> h(flow_n, flow_n);
       h[net.sink] = 0;

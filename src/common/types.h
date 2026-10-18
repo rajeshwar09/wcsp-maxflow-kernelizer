@@ -1,24 +1,19 @@
+// basic types used in the whole project
+// usage: #include "src/common/types.h"
+
 #ifndef MAXFLOW_TYPES_H
 #define MAXFLOW_TYPES_H
 
-// Common small type aliases used across project.
-// Capacities/flows are kept as a TEMPLATE parameter (cap_t) on data structures and algorithms
-// current = int, later with CCG = float/double
-
 namespace maxflow {
 
-  // project-wide capacity/flow type
+  // [TYPES] capacity and flow values, double because perturbed weights can be large
   using cap_t = double;
-  
-  // vertex is just an index into the node arrays
-  using vertex_id_t = int;
 
-  // half-edge is just an index into the edge arrays
+  // [TYPES] vertex and half-edge are plain indices into the arrays
+  using vertex_id_t = int;
   using edge_id_t = int;
 
-  // Convergence threshold for floating-point capacities
-  // Filters out residual micro-excess from double rounding
-  // When cap_t = int, this evaluates to int(1e-8) = 0 (no effect)
+  // [TYPES] values below this are treated as zero, it hides double rounding noise
   #define MAXFLOW_EPSILON cap_t(1e-8)
 
 } // namespace maxflow

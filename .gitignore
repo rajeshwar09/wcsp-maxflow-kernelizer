@@ -1,60 +1,32 @@
-# Build directories
+# .gitignore
+# build output, local data and results never go to git
+
+# [BUILD] programs made by scripts/build.sh
+/e2e_solve
+/e2e_solve_gpu
+/mincut_lattice
+/wcsp_collapse
+/kmf_test
+/cut_audit
+/compare_kernels
+/compare_kernels_gpu
+*.o
 build/
 third_party/**/build/
 third_party/cuda
 
-# Compiled objects and binaries
-*.o
-*.out
-*.exe
-
-# Executables with no file extension, in root and any subfolder
-/e2e_pipeline_test
-/e2e_pipeline_nokernelize
-/benchmark_mac
-/maxflow_cpu_demo
-/maxflow_gpu_topology_demo
-/maxflow_gpu_worklist_demo
-/kernelizer_maxflow_test
-/compare_kernels
-/e2e_pipeline_test_gurobi
-e2e_solve
-e2e_solve_gpu
-mincut_lattice
-/e2e_solve_np
-/wcsp_collapse
-
-# Editor/OS files
-.DS_Store
-.vscode
-
-# Large generated benchmark data
+# [DATA] instance folders and generated benchmarks, they are large
+/instances/
 data/wcsp/*.wcsp
-
-# Benchmark outputs
-*.xlsx
-*.raw.json
-*.raw.csv
-*.avg.json
-results.csv
-/cut_audit
-/compare_kernels_gpu
-/compare_gpu
-/cpu_demo
-/topo_demo
-/e2e_cpu
-/e2e_gpu
-/e2e_pipeline_test_gpu
-/e2e_gpu_prof
-/worklist_demo
-/compare_kernels
-results/
-data/bench/*.wcsp
 data/bench/*
 
-# Log folder
-/log
-log/
-/e2e_nokern
-/kmf_test
-/e2e_gurobi
+# [RESULTS] every script writes into results/<date>/, kept only on the local machine
+results/
+*.xlsx
+
+# [EDITOR] editor and system files
+.vscode/
+.DS_Store
+
+# [PYTHON] cache folder made when one script imports another
+__pycache__/
