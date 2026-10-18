@@ -1,172 +1,179 @@
 #!/usr/bin/env bash
+# run_ceiling.sh
+# finds, for every instance, the most that any min-cut kernelizer could decide (the ceiling), with ./mincut_lattice
+# for each variable it checks if its two copies in the double cover are in the same SCC of the residual graph
+# copies in the same SCC are on the same side of every min cut, so no min-cut method (cpu, gpu or Gurobi LP) can decide them
+# the variables whose copies are in different SCCs give the ceiling
 #
-# run_ceiling.sh -- measure, per instance, the maximum ANY minimum-cut kernelizer could resolve
+# usage: ./scripts/run_ceiling.sh [options] [uai|evalgm|DIR]      (default uai)
+#   uai                  every .uai under <artifact>/uai, non Boolean ones end as SKIP_DOMAIN
+#   evalgm               every .wcsp under <artifact>/evalgm
+#   DIR                  every .wcsp and .uai under any folder, for example ~/mtp/wcsp-maxflow/collapsed
+#   -t, --timeout SEC    limit for one instance, 0 = no limit         (default 900)
+#       --min-vars N     only instances with at least N variables
+#       --max-vars N     only instances with less than N variables
+#       --resume FILE    continue an earlier ceiling tsv, instances already in it are skipped and new rows go into it
+#       --artifact DIR   the local benchmark copy                     (default ~/mtp/wcsp-maxflow/artifact)
+#   -n, --name LABEL     word added to the file names
 #
-# For each variable it asks whether its two copies in the double cover lie in the same SCC of the residual graph
-# Nodes sharing a component fall on the same side of EVERY minimum cut, so no method of this kind -- cpu/gpu or Gurobi's -- can ever resolve them
-# Counting the pairs that do NOT share one gives the ceiling
-#
-set -uo pipefail
-. "$(dirname "$0")/lib/common.sh"
+# output in results/<date>/:
+#   ceiling_<set>_<time>[_label].log   one line per instance and the count of every verdict
+#   ceiling_<set>_<time>[_label].tsv   one row per instance (or the --resume file)
+#   ceiling_<set>_<time>[_label]/      the mincut_lattice output of every instance
+# verdicts: STRUCTURAL (ceiling is 0), OPTIMAL (we already reach the ceiling), SELECTION (a better cut exists),
+#           SKIP_DOMAIN, SKIP_ARITY, EMPTY (no CCG vertices), TIMEOUT, FAIL_rcN
 
-ART=~/mtp/wcsp-maxflow/artifact
-SET="uai"
-TIMEOUT=900
-MINVARS=0
-MAXVARS=0
-RESUME=1
+set -u
+cd "$(dirname "$0")/.." || exit 1
 
-usage() {
-cat <<'USAGE'
-Usage: ./scripts/run_ceiling.sh [options] <set>
-
-Sets:
-  uai        the UAI files (Boolean ones are analysed, rest SKIP)
-  evalgm     the evalgm .wcsp instances
-  <dir>      any directory: every .wcsp/.uai below it
-
-Options:
-  -t, --timeout SEC     per instance, 0 = none        (default: 900)
-      --min-vars N      only instances with >= N vars (default: 0)
-      --max-vars N      only instances with <  N vars (default: no cap)
-      --fresh           ignore existing rows
-      --artifact DIR    default: ~/mtp/wcsp-maxflow/artifact
-  -h, --help
-
-Examples:
-  ./scripts/run_ceiling.sh --max-vars 10000 evalgm
-  ./scripts/run_ceiling.sh --min-vars 10000 -t 1800 evalgm
-  ./scripts/run_ceiling.sh uai
-  ./scripts/run_ceiling.sh ~/mtp/wcsp-maxflow/collapsed
-USAGE
-}
-
+# [ARGS] defaults and command line
+art=~/mtp/wcsp-maxflow/artifact
+set_name="uai"
+timeout_s=900
+min_vars=0
+max_vars=0
+resume=""
+label=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    -t|--timeout)  TIMEOUT="$2"; shift 2 ;;
-    --min-vars)    MINVARS="$2"; shift 2 ;;
-    --max-vars)    MAXVARS="$2"; shift 2 ;;
-    --fresh)       RESUME=0; shift ;;
-    --artifact)    ART="$2"; shift 2 ;;
-    -h|--help)     usage; exit 0 ;;
-    -*)            echo "unknown option: $1" >&2; usage; exit 2 ;;
-    *)             SET="$1"; shift ;;
+    -t|--timeout) timeout_s="$2"; shift 2 ;;
+    --min-vars) min_vars="$2"; shift 2 ;;
+    --max-vars) max_vars="$2"; shift 2 ;;
+    --resume) resume="$2"; shift 2 ;;
+    --artifact) art="$2"; shift 2 ;;
+    -n|--name) label="_$2"; shift 2 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -*) echo "unknown option: $1 (see --help)"; exit 1 ;;
+    *) set_name="$1"; shift ;;
   esac
 done
 
-case "$SET" in
-  uai)    LIST=$(find "$ART/uai" -name '*.uai' | sort); SETNAME=uai ;;
-  evalgm) LIST=$(find "$ART/evalgm" -name '*.wcsp' | sort); SETNAME=evalgm ;;
-  *)      if [ -d "$SET" ]; then
-            LIST=$(find "$SET" \( -name '*.wcsp' -o -name '*.uai' \) | sort)
-            SETNAME="$(basename "$SET")"
-          else
-            echo "unknown set: $SET" >&2; exit 2
-          fi ;;
+# [INSTANCES] the files of the set, in sorted order
+case "$set_name" in
+  uai) dir="$art/uai"; tag=uai; pattern='*.uai' ;;
+  evalgm) dir="$art/evalgm"; tag=evalgm; pattern='*.wcsp' ;;
+  *) dir="$set_name"; tag=$(basename "$set_name"); pattern='' ;;
 esac
-
-mf_init "ceiling_${SETNAME}"
-
-tag="$SETNAME"
-[ "$MINVARS" -gt 0 ] && tag="${tag}_ge${MINVARS}"
-[ "$MAXVARS" -gt 0 ] && tag="${tag}_lt${MAXVARS}"
-TSV="$OUT/ceiling_${tag}.tsv"
-
-[ "$RESUME" = "0" ] && rm -f "$TSV"
-if [ ! -s "$TSV" ]; then
-  printf 'instance\tgroup\tn\tW\tintegral\tallhalf\tsame_pct\tceiling_pct\tdecided_pct\tverdict\twall_s\n' > "$TSV"
-  legend_for "$TSV" <<'EOF'
-instance     benchmark name (extension stripped)
-group        parent folder, i.e. the family
-n            CCG vertices
-W            total vertex weight of the CCG
-integral     are all CCG weights whole numbers (needed for perturbation proof)
-allhalf      YES = LP optimum puts every variable at 1/2; ceiling is then 0
-same_pct     % of variables whose two copies share a residual SCC -> provably undecidable by ANY min-cut method, Gurobi included
-ceiling_pct  % in different SCCs = the most any min-cut kernelizer can decide
-decided_pct  % our current rule actually decides
-verdict      STRUCTURAL   ceiling is exactly 0 -- nothing to win, for anyone
-             OPTIMAL      we already attain the ceiling -- nothing to fix
-             SELECTION    a better cut exists -- worth attacking
-             SKIP_DOMAIN  loader refused: non-Boolean or domain-1 variable
-             SKIP_ARITY   a constraint is too wide for the CCG (2^(2*arity))
-             EMPTY        the CCG has no vertices
-             TIMEOUT      ran out of time
-             FAIL_RCn     crashed with exit code n
-wall_s       seconds spent on this instance
-EOF
+if [ ! -d "$dir" ]; then
+  echo "folder not found: $dir"
+  exit 1
+fi
+if [ -n "$pattern" ]; then
+  mapfile -t files < <(find "$dir" -name "$pattern" | sort)
+else
+  mapfile -t files < <(find "$dir" \( -name '*.wcsp' -o -name '*.uai' \) | sort)
+fi
+if [ ! -x ./mincut_lattice ]; then
+  echo "./mincut_lattice not found, run ./scripts/build.sh core first"
+  exit 1
+fi
+if [ -n "$resume" ] && [ ! -f "$resume" ]; then
+  echo "resume file not found: $resume"
+  exit 1
 fi
 
-total=$(printf '%s\n' "$LIST" | grep -c .)
-record_env "$OUT/env_ceiling.txt"
-say "set        : $SETNAME   files: $total"
-say "timeout    : $TIMEOUT s   min-vars: $MINVARS   max-vars: $MAXVARS"
-say "table      : $TSV"
-say ""
+# [FILES] names of the output files of this run, the size filter goes into the name
+[ "$min_vars" -gt 0 ] && tag="${tag}_ge$min_vars"
+[ "$max_vars" -gt 0 ] && tag="${tag}_lt$max_vars"
+stamp="ceiling_${tag}_$(date +%H%M%S)${label}"
+out_dir="results/$(date +%F)"
+raw_dir="$out_dir/$stamp"
+log="$out_dir/$stamp.log"
+tsv="$out_dir/$stamp.tsv"
+mkdir -p "$raw_dir"
+if [ -n "$resume" ]; then
+  tsv="$resume"
+else
+  printf 'instance\tgroup\tn\tW\tintegral\tallhalf\tsame_pct\tceiling_pct\tdecided_pct\tverdict\twall_s\n' > "$tsv"
+fi
 
-# nvars: line 2 of a .uai, field 2 of line 1 of a .wcsp
+say() {
+  echo "$*" | tee -a "$log"
+}
+
+say "ceiling $(date '+%F %T')  commit $(git rev-parse --short HEAD)  branch $(git rev-parse --abbrev-ref HEAD)"
+say "set $tag  folder $dir  files ${#files[@]}  timeout $timeout_s  min_vars $min_vars  max_vars $max_vars  resume ${resume:-no}"
+say "table $tsv"
+
+# [RUN] variable count: line 2 of a .uai, field 2 of line 1 of a .wcsp
 nvars_of() {
   case "$1" in
-    *.uai)  sed -n '2p' "$1" | tr -d ' \r' ;;
-    *)      head -1 "$1" | awk '{print $2}' ;;
+    *.uai) sed -n '2p' "$1" | tr -d ' \r' ;;
+    *) head -1 "$1" | awk '{print $2}' ;;
   esac
+}
+
+# [RUN] text after the first ':' of the first line with this label
+field() {
+  sed -n "s/.*$1[^:]*: *//p" "$2" | head -1
+}
+
+# [RUN] the percent of a line like "label : 123 (45.6%)"
+pct() {
+  sed -n "s/.*$1 *: *[0-9]*  *(\([0-9.e+-]*\)%).*/\1/p" "$2" | head -1
 }
 
 i=0
-printf '%s\n' "$LIST" | while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  i=$((i+1))
-  b=$(basename "$f"); b="${b%.uai}"; b="${b%.wcsp}"
-  grp=$(basename "$(dirname "$f")")
+for f in "${files[@]}"; do
+  i=$((i + 1))
+  name=$(basename "$f")
+  name="${name%.*}"
+  group=$(basename "$(dirname "$f")")
 
-  if [ "$RESUME" = "1" ] && awk -F'\t' -v a="$b" -v g="$grp" 'NR>1 && $1==a && $2==g {found=1} END{exit !found}' "$TSV"; then
+  # [RUN] skip instances already in the resume table and instances outside the size filter
+  if [ -n "$resume" ] && awk -F'\t' -v a="$name" -v g="$group" 'NR > 1 && $1 == a && $2 == g { found = 1 } END { exit !found }' "$tsv"; then
     continue
   fi
-
   nv=$(nvars_of "$f")
-  case "$nv" in ''|*[!0-9]*) nv=0 ;; esac
-  [ "$MINVARS" -gt 0 ] && [ "$nv" -lt "$MINVARS" ] && continue
-  [ "$MAXVARS" -gt 0 ] && [ "$nv" -ge "$MAXVARS" ] && continue
+  case "$nv" in
+    ''|*[!0-9]*) nv=0 ;;
+  esac
+  [ "$min_vars" -gt 0 ] && [ "$nv" -lt "$min_vars" ] && continue
+  [ "$max_vars" -gt 0 ] && [ "$nv" -ge "$max_vars" ] && continue
 
-  s=$(date +%s)
-  if [ "$TIMEOUT" -gt 0 ]; then
-    o=$(timeout "$TIMEOUT" ./mincut_lattice "$f" 2>&1); rc=$?
+  raw="$raw_dir/${group}__$name.out"
+  t0=$(date +%s)
+  if [ "$timeout_s" -gt 0 ]; then
+    timeout "$timeout_s" ./mincut_lattice "$f" > "$raw" 2>&1 < /dev/null
   else
-    o=$(./mincut_lattice "$f" 2>&1); rc=$?
+    ./mincut_lattice "$f" > "$raw" 2>&1 < /dev/null
   fi
-  e=$(( $(date +%s) - s ))
+  rc=$?
+  wall=$(( $(date +%s) - t0 ))
 
-  #  Distinguish the non-result outcomes properly
-  if [ "$rc" = "6" ]; then v=SKIP_ARITY
-  elif [ "$rc" = "5" ]; then v=SKIP_DOMAIN
-  elif printf '%s' "$o" | grep -q 'empty CCG'; then v=EMPTY
-  elif [ "$rc" = "124" ]; then v=TIMEOUT
-  elif printf '%s' "$o" | grep -q 'skipped --'; then v=SKIP_DOMAIN
+  # [VERDICT] from the exit code or the output of mincut_lattice
+  if [ "$rc" = "6" ]; then
+    v=SKIP_ARITY
+  elif [ "$rc" = "5" ]; then
+    v=SKIP_DOMAIN
+  elif grep -q 'empty CCG' "$raw"; then
+    v=EMPTY
+  elif [ "$rc" = "124" ]; then
+    v=TIMEOUT
+  elif grep -q 'skipped --' "$raw"; then
+    v=SKIP_DOMAIN
   else
-    v=$(printf '%s' "$o" | sed -n 's/.*VERDICT: \([A-Z]*\).*/\1/p' | head -1)
+    v=$(sed -n 's/.*VERDICT: \([A-Z]*\).*/\1/p' "$raw" | head -1)
     [ -z "$v" ] && v="FAIL_rc$rc"
   fi
 
-  g() { printf '%s' "$o" | sed -n "s/.*$1[^:]*: *//p" | head -1; }
-  pct() { printf '%s' "$o" | sed -n "s/.*$1 *: *[0-9]*  *(\([0-9.e+-]*\)%).*/\1/p" | head -1; }
-
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$b" "$grp" "$(g 'CCG vertices n')" "$(g 'total vertex weight W')" \
-    "$(g 'weights integral?')" "$(g 'all-half optimal?')" \
-    "$(pct 'SAME SCC')" "$(pct 'DIFFERENT SCCs')" "$(pct 'decided by current rule')" \
-    "$v" "$e" >> "$TSV"
-
-  printf '  [%4d/%-4d] %-38s %-16s %-12s %ss\n' "$i" "$total" "${b:0:38}" "$grp" "$v" "$e" | tee -a "$RUNLOG"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$group" \
+    "$(field 'CCG vertices n' "$raw")" "$(field 'total vertex weight W' "$raw")" \
+    "$(field 'weights integral?' "$raw")" "$(field 'all-half optimal?' "$raw")" \
+    "$(pct 'SAME SCC' "$raw")" "$(pct 'DIFFERENT SCCs' "$raw")" "$(pct 'decided by current rule' "$raw")" \
+    "$v" "$wall" >> "$tsv"
+  say "$(printf '%4d / %-4d  %-38s  %-16s  %-12s  %s s' "$i" "${#files[@]}" "${name:0:38}" "$group" "$v" "$wall")"
 done
 
+# [SUMMARY] count of every verdict, and the part at the ceiling among real verdicts
 say ""
-say "=== verdicts ==="
-awk -F'\t' 'NR>1{c[$10]++; t++} END{for(k in c) printf "  %-12s %4d  (%.1f%%)\n", k, c[k], 100*c[k]/t; printf "  ------------ %d\n", t}' "$TSV" | tee -a "$RUNLOG"
+say "verdicts"
+awk -F'\t' 'NR > 1 { c[$10]++; t++ } END { for (k in c) printf "  %-12s %5d  %5.1f %%\n", k, c[k], 100 * c[k] / t; printf "  total        %5d\n", t }' "$tsv" | tee -a "$log"
 say ""
-say "=== among instances that produced a verdict ==="
-awk -F'\t' 'NR>1 && ($10=="STRUCTURAL"||$10=="OPTIMAL"||$10=="SELECTION"){c[$10]++; t++}
-  END{if(t==0){print "  none"; exit}
-      for(k in c) printf "  %-12s %4d  (%.1f%%)\n", k, c[k], 100*c[k]/t
-      printf "  at the ceiling (STRUCTURAL+OPTIMAL): %.1f%%\n", 100*(c["STRUCTURAL"]+c["OPTIMAL"])/t}' "$TSV" | tee -a "$RUNLOG"
+say "among STRUCTURAL, OPTIMAL and SELECTION"
+awk -F'\t' 'NR > 1 && ($10 == "STRUCTURAL" || $10 == "OPTIMAL" || $10 == "SELECTION") { c[$10]++; t++ }
+  END { if (t == 0) { print "  none"; exit }
+        for (k in c) printf "  %-12s %5d  %5.1f %%\n", k, c[k], 100 * c[k] / t
+        printf "  at the ceiling (STRUCTURAL + OPTIMAL) %.1f %%\n", 100 * (c["STRUCTURAL"] + c["OPTIMAL"]) / t }' "$tsv" | tee -a "$log"
 say ""
-say "done. table: $TSV"
+say "files  $log  $tsv  $raw_dir/"

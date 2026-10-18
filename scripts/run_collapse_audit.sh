@@ -1,262 +1,233 @@
 #!/usr/bin/env bash
+# run_collapse_audit.sh
+# collapses the domain-1 instances with ./wcsp_collapse and checks that every collapse kept the same problem
+# for every instance:
+#   1. ./wcsp_collapse in.wcsp out.wcsp       removes the domain-1 constants
+#   2. scripts/audit_collapse.py in out       does the collapse again and checks structure, folded constant and
+#                                             cost_original(x, constants = 0) = cost_collapsed(x) + folded_constant
+#   3. optional, for tiny instances: the true optimum of the original by trying all assignments (--brute-max)
+#      against an ILP solve of the collapsed file (--ilp), the two must match
 #
-# run_collapse_audit.sh -- collapse the domain-1 instances and prove that each collapse preserved the problem
+# usage: ./scripts/run_collapse_audit.sh [options] [domain1|DIR|FILE]      (default domain1)
+#   domain1               every instance that data/artifact/manifest.tsv marks as domain1 and copied
+#   DIR                   every .wcsp under a folder
+#   FILE                  text file with one .wcsp path per line
+#       --dest DIR        where the collapsed files go              (default ~/mtp/wcsp-maxflow/collapsed)
+#       --artifact DIR    the local benchmark copy                  (default ~/mtp/wcsp-maxflow/artifact)
+#       --only NAMES      comma list of instance names, without extension
+#       --limit N         stop after N instances
+#       --samples N       random assignments per instance           (default 200)
+#       --exhaustive-max N  check every assignment below N variables (default 12)
+#       --budget N        limit on assignments x constraints        (default 2000000)
+#       --brute-max K     true optimum of the original when the collapsed file has at most K variables, 0 = off (default 0)
+#       --ilp             also solve each collapsed file with e2e_solve --solver ilp
+#       --ilp-max-vars N  only ILP solve files up to N variables    (default 40)
+#   -t, --timeout SEC     limit for one ILP solve, 0 = no limit     (default 300)
+#       --resume FILE     continue an earlier audit tsv, instances already in it are skipped
+#   -n, --name LABEL      word added to the file names
 #
-# For every instance it do:
-#   1. ./wcsp_collapse in.wcsp out.wcsp        -- remove the domain-1 constants
-#   2. scripts/audit_collapse.py in out        -- re-drive the collapse and check it: structure, folded constant, and the cost identity
-#          cost_original(x, constants=0) == cost_collapsed(x) + folded_constant
-#   3. optionally, for small instances, brute-force the original optimum and compare it against a real ILP solve of the collapsed file, end to end
+# output in results/<date>/:
+#   collapse_audit_<set>_<time>[_label].log   one line per instance and a summary
+#   collapse_audit_<set>_<time>[_label].tsv   one row per instance (or the --resume file)
+#   collapse_audit_<set>_<time>[_label]/      collapse, audit and ilp output of every instance
 
-set -uo pipefail
-. "$(dirname "$0")/lib/common.sh"
+set -u
+cd "$(dirname "$0")/.." || exit 1
 
-ART=~/mtp/wcsp-maxflow/artifact
-DEST=~/mtp/wcsp-maxflow/collapsed
-SET="domain1"
-ONLY=""
-LIMIT=0
-SAMPLES=200
-EXHMAX=12
-BUDGET=2000000
-BRUTEMAX=0
-ILP=0
-ILPMAXVARS=40
-TIMEOUT=300
-RESUME=1
+# [ARGS] defaults and command line
+art=~/mtp/wcsp-maxflow/artifact
+dest=~/mtp/wcsp-maxflow/collapsed
+set_name="domain1"
+only=""
+limit=0
+samples=200
+exh_max=12
+budget=2000000
+brute_max=0
+use_ilp=0
+ilp_max_vars=40
+timeout_s=300
+resume=""
+label=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dest) dest="$2"; shift 2 ;;
+    --artifact) art="$2"; shift 2 ;;
+    --only) only="$2"; shift 2 ;;
+    --limit) limit="$2"; shift 2 ;;
+    --samples) samples="$2"; shift 2 ;;
+    --exhaustive-max) exh_max="$2"; shift 2 ;;
+    --budget) budget="$2"; shift 2 ;;
+    --brute-max) brute_max="$2"; shift 2 ;;
+    --ilp) use_ilp=1; shift ;;
+    --ilp-max-vars) ilp_max_vars="$2"; shift 2 ;;
+    -t|--timeout) timeout_s="$2"; shift 2 ;;
+    --resume) resume="$2"; shift 2 ;;
+    -n|--name) label="_$2"; shift 2 ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    -*) echo "unknown option: $1 (see --help)"; exit 1 ;;
+    *) set_name="$1"; shift ;;
+  esac
+done
 
-usage() {
-cat <<'USAGE'
-Usage: ./scripts/run_collapse_audit.sh [options] [set]
+# [INSTANCES] each line is <full path><TAB><path inside the collection>, the second part keeps the folder layout in --dest
+manifest=data/artifact/manifest.tsv
+if [ "$set_name" = "domain1" ]; then
+  tag=domain1
+  if [ ! -s "$manifest" ]; then
+    echo "$manifest not found, run ./scripts/stage_artifact.sh first"
+    exit 1
+  fi
+  mapfile -t list < <(awk -F'\t' -v art="$art" 'NR > 1 && $6 == "domain1" && $7 == "yes" { print art "/" $1 "\t" $1 }' "$manifest")
+elif [ -d "$set_name" ]; then
+  tag=$(basename "$set_name")
+  mapfile -t list < <(find "$set_name" -name '*.wcsp' -type f | sort | awk -v root="$set_name" '{ print $0 "\t" substr($0, length(root) + 2) }')
+elif [ -f "$set_name" ]; then
+  tag=$(basename "$set_name")
+  tag="${tag%.*}"
+  mapfile -t list < <(grep -v '^[[:space:]]*$' "$set_name" | cut -f1 | awk -F/ '{ print $0 "\t" $(NF-1) "/" $NF }')
+else
+  echo "set not found: $set_name"
+  exit 1
+fi
 
-Sets:
-domain1    every instance manifest classes as domain1   (default)
-<dir>      every .wcsp below a directory
-<file>     text file listing one .wcsp path per line
+# [INSTANCES] keep only the names given with --only
+if [ -n "$only" ]; then
+  mapfile -t list < <(printf '%s\n' "${list[@]}" | awk -F'\t' -v want=",$only," '{ n = split($1, p, "/"); b = p[n]; sub(/\.wcsp$/, "", b); if (index(want, "," b ",")) print }')
+fi
 
-Options:
-    --dest DIR          where collapsed files go (default: ~/mtp/wcsp-maxflow/collapsed)
-    --artifact DIR      default: ~/mtp/wcsp-maxflow/artifact
-    --only NAMES        comma list of instance names to run (no extension)
-    --limit N           stop after N instances
-    --samples N         random assignments per instance   (default 200)
-    --exhaustive-max N  test EVERY assignment below N vars (default 12)
-    --budget N          cap on assignments x constraints  (default 2000000)
-    --brute-max K       brute-force the ORIGINAL optimum when the collapsed instance has <= K variables, 0 = off (default 0)
-    --ilp               also solve each collapsed file with e2e_solve --solver ilp
-    --ilp-max-vars N    only ILP-solve instances up to N variables (default 40)
--t, --timeout SEC       per instance, 0 = none            (default 300)
-    --fresh             ignore existing rows, start over
--h, --help
+# [CHECK] programs and the resume file
+if [ ! -x ./wcsp_collapse ]; then
+  echo "./wcsp_collapse not found, run ./scripts/build.sh core first"
+  exit 1
+fi
+if [ "$use_ilp" = 1 ] && [ ! -x ./e2e_solve ]; then
+  echo "./e2e_solve not found, run ./scripts/build.sh core first"
+  exit 1
+fi
+if [ -n "$resume" ] && [ ! -f "$resume" ]; then
+  echo "resume file not found: $resume"
+  exit 1
+fi
 
-Examples:
-# step 1: the four instances that exercise the tricky partial-scope path
-./scripts/run_collapse_audit.sh --only rand695_l1 --brute-max 16 --ilp domain1
+# [FILES] names of the output files of this run
+stamp="collapse_audit_${tag}_$(date +%H%M%S)${label}"
+out_dir="results/$(date +%F)"
+raw_dir="$out_dir/$stamp"
+log="$out_dir/$stamp.log"
+tsv="$out_dir/$stamp.tsv"
+mkdir -p "$raw_dir" "$dest"
+if [ -n "$resume" ]; then
+  tsv="$resume"
+else
+  printf 'instance\tfamily\torig_vars\tkept_vars\tdropped_vars\torig_cons\tkept_cons\tfolded_cons\tshrunk_cons\tfolded_const\taudit\tchecked\tcheck_mode\twarnings\tbrute_optimum\tilp_optimum\tend_to_end\twall_s\n' > "$tsv"
+fi
 
-# step 2: the whole domain-1 group
-./scripts/run_collapse_audit.sh domain1
-USAGE
+say() {
+  echo "$*" | tee -a "$log"
 }
 
-while [ $# -gt 0 ]; do
-case "$1" in
-  --dest)            DEST="$2"; shift 2 ;;
-  --artifact)        ART="$2"; shift 2 ;;
-  --only)            ONLY="$2"; shift 2 ;;
-  --limit)           LIMIT="$2"; shift 2 ;;
-  --samples)         SAMPLES="$2"; shift 2 ;;
-  --exhaustive-max)  EXHMAX="$2"; shift 2 ;;
-  --budget)          BUDGET="$2"; shift 2 ;;
-  --brute-max)       BRUTEMAX="$2"; shift 2 ;;
-  --ilp)             ILP=1; shift ;;
-  --ilp-max-vars)    ILPMAXVARS="$2"; shift 2 ;;
-  -t|--timeout)      TIMEOUT="$2"; shift 2 ;;
-  --fresh)           RESUME=0; shift ;;
-  -h|--help)         usage; exit 0 ;;
-  -*)                echo "unknown option: $1" >&2; usage; exit 2 ;;
-  *)                 SET="$1"; shift ;;
-esac
-done
-
-# the instance list
-# Each entry is  <absolute path><TAB><path relative to the collection root>
-
-MANIFEST="data/artifact/manifest.tsv"
-case "$SET" in
-domain1)
-  SETNAME=domain1
-  if [ ! -s "$MANIFEST" ]; then
-    echo "error: $MANIFEST not found -- run ./scripts/stage_artifact.sh first" >&2
-    exit 2
-  fi
-  LIST=$(awk -F'\t' -v art="$ART" 'NR>1 && $6=="domain1" && $7=="yes" {print art "/" $1 "\t" $1}' "$MANIFEST")
-  ;;
-*)
-  if [ -d "$SET" ]; then
-    SETNAME="$(basename "$SET")"
-    LIST=$(find "$SET" -name '*.wcsp' -type f | sort | awk -v root="$SET" '{print $0 "\t" substr($0, length(root)+2)}')
-  elif [ -f "$SET" ]; then
-    SETNAME="$(basename "$SET")"; SETNAME="${SETNAME%.*}"
-    LIST=$(grep -v '^[[:space:]]*$' "$SET" | awk -F/ '{print $0 "\t" $(NF-1) "/" $NF}')
-  else
-    echo "unknown set: $SET" >&2; exit 2
-  fi
-  ;;
-esac
-
-if [ -n "$ONLY" ]; then
-LIST=$(printf '%s\n' "$LIST" | awk -F'\t' -v want=",$ONLY," '{ n=split($1,p,"/"); b=p[n]; sub(/\.wcsp$/,"",b); if (index(want, "," b ",")) print }')
-fi
-
-mf_init "collapse_audit_${SETNAME}"
-mkdir -p "$DEST"
-
-[ -x ./wcsp_collapse ] || { say "error: ./wcsp_collapse not built (./scripts/run_study.sh build)"; exit 2; }
-[ "$ILP" = "1" ] && { [ -x ./e2e_solve ] || { say "error: ./e2e_solve not built"; exit 2; }; }
-
-TSV="$OUT/collapse_audit_${SETNAME}.tsv"
-[ "$RESUME" = "0" ] && rm -f "$TSV"
-if [ ! -s "$TSV" ]; then
-printf 'instance\tfamily\torig_vars\tkept_vars\tdropped_vars\torig_cons\tkept_cons\tfolded_cons\tshrunk_cons\tfolded_const\taudit\tchecked\tcheck_mode\twarnings\tbrute_optimum\tilp_optimum\tend_to_end\twall_s\n' > "$TSV"
-legend_for "$TSV" <<'EOF'
-instance       instance name no extension
-family         parent folder of original instance
-orig_vars      variables in original file
-kept_vars      variables left after removing the domain-1 constants
-dropped_vars   how many constants were removed (orig_vars - kept_vars)
-orig_cons      constraints in original file
-kept_cons      constraints written to collapsed file
-folded_cons    constraints whose whole scope was constants and each became one fixed number instead of a constraint
-shrunk_cons    constraints that straddled constants and free variables, so their cost table had to be sliced -- THE RISKY PATH, this is the column to watch
-folded_const   total fixed cost taken out of  file
-audit          PASS               every check agreed: the collapsed instance is same problem minus the constants
-              FAIL               a check disagreed - read the .log for which
-              SKIP_NO_CONSTANTS  no domain-1 variable here, nothing to do
-              SKIP_MULTIVALUED   a variable has domain >= 3; collapse refuses - no CCG method can take it
-              FAIL_COLLAPSE_rcN  wcsp_collapse itself failed
-              FAIL_AUDIT_rcN     auditor could not run
-checked        how many assignments checked for cost identity cost_original(x, constants=0) == cost_collapsed(x) + folded_const
-check_mode     exhaustive = every possible assignment was tested
-              random     = a fixed-seed sample
-              trivial    = nothing survived so only the constant was checked
-warnings       count of input oddities noted in the log (duplicate tuples, a
-              negative default cost, ...). Warnings do NOT fail the audit
-brute_optimum  true optimum of the ORIGINAL model, found by trying every
-              assignment. Only for tiny instances (--brute-max), else NA
-ilp_optimum    optimum of the COLLAPSED file from real solve
-              (e2e_solve --solver ilp). NA unless --ilp was given
-end_to_end     MATCH  = brute_optimum == ilp_optimum + folded_const, i.e. the
-                      whole chain agrees on the real answer
-              DIFFER = they disagree -- investigate before trusting the group
-              NA     = one of the two numbers was not computed
-wall_s         seconds spent on this instance
-EOF
-fi
-
-total=$(printf '%s\n' "$LIST" | grep -c .)
-record_env "$OUT/env_collapse_audit.txt"
-say "set            : $SETNAME   instances: $total"
-say "collapsed into : $DEST"
-say "samples        : $SAMPLES   exhaustive below: $EXHMAX vars   budget: $BUDGET"
-say "brute-force    : $([ "$BRUTEMAX" -gt 0 ] && echo "<= $BRUTEMAX vars" || echo off)"
-say "ilp solve      : $([ "$ILP" = "1" ] && echo "on, <= $ILPMAXVARS vars" || echo off)"
-say ""
+say "collapse audit $(date '+%F %T')  commit $(git rev-parse --short HEAD)  branch $(git rev-parse --abbrev-ref HEAD)"
+say "set $tag  instances ${#list[@]}  collapsed into $dest  resume ${resume:-no}"
+say "samples $samples  exhaustive below $exh_max vars  budget $budget  brute_max $brute_max  ilp $use_ilp (up to $ilp_max_vars vars)"
+say "table $tsv"
 
 i=0
-printf '%s\n' "$LIST" | while IFS=$'\t' read -r f rel; do
-[ -n "$f" ] || continue
-i=$((i+1))
-[ "$LIMIT" -gt 0 ] && [ "$i" -gt "$LIMIT" ] && break
-b="$(basename "$f")"; b="${b%.wcsp}"
-fam="$(basename "$(dirname "$f")")"
+for entry in "${list[@]}"; do
+  f="${entry%%$'\t'*}"
+  rel="${entry#*$'\t'}"
+  i=$((i + 1))
+  [ "$limit" -gt 0 ] && [ "$i" -gt "$limit" ] && break
+  name=$(basename "$f")
+  name="${name%.wcsp}"
+  family=$(basename "$(dirname "$f")")
 
-if [ "$RESUME" = "1" ] && awk -F'\t' -v a="$b" 'NR>1 && $1==a {found=1} END{exit !found}' "$TSV"; then
-  continue
-fi
-if [ ! -f "$f" ]; then say "  MISSING $b ($f)"; continue; fi
-
-s=$(date +%s)
-cf="$DEST/$rel"
-mkdir -p "$(dirname "$cf")"
-
-# 1 collapse
-co="$RAW/collapse_${b}.txt"
-./wcsp_collapse "$f" "$cf" > "$co" 2>&1
-crc=$?
-
-verdict=""; checked=NA; mode=NA; warn=NA; brute=NA; ilp=NA; e2e=NA
-ov=NA; kv=NA; dv=NA; oc=NA; kc=NA; fc=NA; sc=NA; fk=NA
-
-case $crc in
-  0) ;;
-  3) verdict=SKIP_MULTIVALUED ;;
-  4) verdict=SKIP_NO_CONSTANTS ;;
-  *) verdict="FAIL_COLLAPSE_rc$crc" ;;
-esac
-
-# 2 audit
-if [ -z "$verdict" ]; then
-  ao="$RAW/audit_${b}.txt"
-  python3 scripts/audit_collapse.py "$f" "$cf" --samples "$SAMPLES" --exhaustive-max "$EXHMAX" --budget "$BUDGET" --brute "$BRUTEMAX" > "$ao" 2>&1
-  arc=$?
-  line="$(grep '^AUDIT ' "$ao" | tail -1)"
-  if [ -z "$line" ]; then
-    verdict="FAIL_AUDIT_rc$arc"
-  else
-    kv_of() { printf '%s\n' "$line" | sed -n "s/.*$1=\([^ ]*\).*/\1/p"; }
-    verdict="$(kv_of verdict)"
-    ov="$(kv_of orig_vars)";    kv="$(kv_of kept_vars)"
-    dv="$(kv_of dropped_vars)"; oc="$(kv_of orig_cons)"
-    kc="$(kv_of kept_cons)";    fc="$(kv_of folded_cons)"
-    sc="$(kv_of shrunk_cons)";  fk="$(kv_of folded_const)"
-    checked="$(kv_of checked)"; mode="$(kv_of mode)"
-    warn="$(kv_of warnings)";   brute="$(kv_of brute)"
-    grep -q '^MISMATCH' "$ao" && say "  --- mismatches for $b ---" && grep '^MISMATCH' "$ao" | head -5 | tee -a "$RUNLOG"
-    grep '^WARNING' "$ao" | head -3 | sed "s/^/  [$b] /" | tee -a "$RUNLOG" >/dev/null
+  if [ -n "$resume" ] && awk -F'\t' -v a="$name" 'NR > 1 && $1 == a { found = 1 } END { exit !found }' "$tsv"; then
+    continue
   fi
-fi
-
-# 3 optional end-to-end solve
-if [ "$ILP" = "1" ] && [ "$verdict" = "PASS" ] && [ "$kv" != "NA" ] \
-    && [ "$kv" -le "$ILPMAXVARS" ] && [ "$kv" -gt 0 ]; then
-  so="$RAW/ilp_${b}.txt"
-  if [ "$TIMEOUT" -gt 0 ]; then
-    timeout "$TIMEOUT" ./e2e_solve --kernelizer none --solver ilp "$cf" > "$so" 2>&1
-  else
-    ./e2e_solve --kernelizer none --solver ilp "$cf" > "$so" 2>&1
+  if [ ! -f "$f" ]; then
+    say "  missing $name ($f)"
+    continue
   fi
-  ilp="$(sed -n 's/^\[e2e\] FINAL OPTIMUM *: *//p' "$so" | head -1)"
-  case "$ilp" in ''|\<*) ilp=NA ;; esac
-  if [ "$brute" != "NA" ] && [ "$ilp" != "NA" ]; then
-    e2e=$(awk -v b="$brute" -v i="$ilp" -v k="$fk" 'BEGIN{print (b==i+k) ? "MATCH" : "DIFFER"}')
+
+  t0=$(date +%s)
+  cf="$dest/$rel"
+  mkdir -p "$(dirname "$cf")"
+
+  # [COLLAPSE] code 3 = a variable with domain 3 or more, code 4 = no domain-1 variable
+  ./wcsp_collapse "$f" "$cf" > "$raw_dir/${name}.collapse.out" 2>&1 < /dev/null
+  crc=$?
+  verdict=""
+  checked=NA; mode=NA; warn=NA; brute=NA; ilp=NA; e2e=NA
+  ov=NA; kv=NA; dv=NA; oc=NA; kc=NA; fc=NA; sc=NA; fk=NA
+  case $crc in
+    0) ;;
+    3) verdict=SKIP_MULTIVALUED ;;
+    4) verdict=SKIP_NO_CONSTANTS ;;
+    *) verdict="FAIL_COLLAPSE_rc$crc" ;;
+  esac
+
+  # [AUDIT] values come from the last "AUDIT key=value" line
+  if [ -z "$verdict" ]; then
+    ao="$raw_dir/${name}.audit.out"
+    python3 scripts/audit_collapse.py "$f" "$cf" --samples "$samples" --exhaustive-max "$exh_max" --budget "$budget" \
+      --brute "$brute_max" > "$ao" 2>&1 < /dev/null
+    arc=$?
+    line=$(grep '^AUDIT ' "$ao" | tail -1)
+    if [ -z "$line" ]; then
+      verdict="FAIL_AUDIT_rc$arc"
+    else
+      kv_of() {
+        printf '%s\n' "$line" | sed -n "s/.* $1=\([^ ]*\).*/\1/p"
+      }
+      verdict=$(kv_of verdict)
+      ov=$(kv_of orig_vars); kv=$(kv_of kept_vars); dv=$(kv_of dropped_vars)
+      oc=$(kv_of orig_cons); kc=$(kv_of kept_cons); fc=$(kv_of folded_cons)
+      sc=$(kv_of shrunk_cons); fk=$(kv_of folded_const)
+      checked=$(kv_of checked); mode=$(kv_of mode); warn=$(kv_of warnings); brute=$(kv_of brute)
+      if grep -q '^MISMATCH' "$ao"; then
+        say "  mismatches for $name"
+        grep '^MISMATCH' "$ao" | head -5 | tee -a "$log"
+      fi
+    fi
   fi
-fi
 
-e=$(( $(date +%s) - s ))
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-  "$b" "$fam" "$ov" "$kv" "$dv" "$oc" "$kc" "$fc" "$sc" "$fk" \
-  "$verdict" "$checked" "$mode" "$warn" "$brute" "$ilp" "$e2e" "$e" >> "$TSV"
+  # [ILP] optional solve of the collapsed file, the original optimum must be the ILP optimum plus the folded constant
+  if [ "$use_ilp" = 1 ] && [ "$verdict" = "PASS" ] && [ "$kv" != "NA" ] && [ "$kv" -gt 0 ] && [ "$kv" -le "$ilp_max_vars" ]; then
+    so="$raw_dir/${name}.ilp.out"
+    if [ "$timeout_s" -gt 0 ]; then
+      timeout "$timeout_s" ./e2e_solve --kernelizer none --solver ilp "$cf" > "$so" 2>&1 < /dev/null
+    else
+      ./e2e_solve --kernelizer none --solver ilp "$cf" > "$so" 2>&1 < /dev/null
+    fi
+    ilp=$(sed -n 's/^\[info\] final_optimum : //p' "$so" | head -1)
+    case "$ilp" in
+      ''|*[!0-9.eE+-]*) ilp=NA ;;
+    esac
+    if [ "$brute" != "NA" ] && [ "$ilp" != "NA" ]; then
+      e2e=$(awk -v b="$brute" -v i="$ilp" -v k="$fk" 'BEGIN { print (b == i + k) ? "MATCH" : "DIFFER" }')
+    fi
+  fi
 
-printf '  [%4d/%-4d] %-38s %-14s %-8s vars %6s -> %-6s shrunk=%-5s %ss\n' \
-  "$i" "$total" "${b:0:38}" "$fam" "$verdict" "$ov" "$kv" "$sc" "$e" | tee -a "$RUNLOG"
+  wall=$(( $(date +%s) - t0 ))
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$family" "$ov" "$kv" "$dv" \
+    "$oc" "$kc" "$fc" "$sc" "$fk" "$verdict" "$checked" "$mode" "$warn" "$brute" "$ilp" "$e2e" "$wall" >> "$tsv"
+  say "$(printf '%4d / %-4d  %-38s  %-14s  %-8s  vars %6s -> %-6s  shrunk %-5s  %s s' "$i" "${#list[@]}" "${name:0:38}" "$family" "$verdict" "$ov" "$kv" "$sc" "$wall")"
 done
 
-# summary
-
+# [SUMMARY] verdicts, the risky sliced constraints, the size saved and the end to end check
 say ""
-say "=== audit verdicts"
-awk -F'\t' 'NR>1{c[$11]++; t++} END{for(k in c) printf "  %-20s %5d  (%.1f%%)\n", k, c[k], 100*c[k]/t; printf "  -------------------- %d\n", t}' "$TSV" | sort | tee -a "$RUNLOG"
+say "audit verdicts"
+awk -F'\t' 'NR > 1 { c[$11]++; t++ } END { for (k in c) printf "  %-20s %5d  %5.1f %%\n", k, c[k], 100 * c[k] / t; printf "  total                %5d\n", t }' "$tsv" | sort | tee -a "$log"
 say ""
-say "=== risky path: constraints sliced across constants"
-awk -F'\t' 'NR>1 && $9!="NA" && $9+0>0 {n++; printf "  %-38s %-14s shrunk=%-6s audit=%s\n", $1, $2, $9, $11}
-END{printf "  instances exercising it: %d\n", n+0}' "$TSV" | tee -a "$RUNLOG"
+say "instances with constraints sliced across constants (the risky path)"
+awk -F'\t' 'NR > 1 && $9 != "NA" && $9 + 0 > 0 { n++ } END { printf "  %d\n", n + 0 }' "$tsv" | tee -a "$log"
 say ""
-say "=== recovered size"
-awk -F'\t' 'NR>1 && $11=="PASS" {ov+=$3; kv+=$4; n++}
-END{if(n) printf "  %d instances PASSED: %d variables -> %d  (%.1f%% were constants)\n", n, ov, kv, 100*(ov-kv)/ov; else print "  none"}' "$TSV" | tee -a "$RUNLOG"
+say "size after collapse (PASS only)"
+awk -F'\t' 'NR > 1 && $11 == "PASS" { ov += $3; kv += $4; n++ }
+  END { if (n) printf "  %d instances: %d variables -> %d  (%.1f %% were constants)\n", n, ov, kv, 100 * (ov - kv) / ov; else print "  none" }' "$tsv" | tee -a "$log"
 say ""
-say "=== end-to-end optimum check"
-awk -F'\t' 'NR>1 && $17!="NA" {c[$17]++} END{if(length(c)==0){print "  not run (use --ilp with --brute-max)"; exit} for(k in c) printf "  %-8s %5d\n", k, c[k]}' "$TSV" | tee -a "$RUNLOG"
+say "end to end optimum check"
+awk -F'\t' 'NR > 1 && $17 != "NA" { c[$17]++ } END { if (length(c) == 0) { print "  not run (use --ilp with --brute-max)"; exit } for (k in c) printf "  %-8s %5d\n", k, c[k] }' "$tsv" | tee -a "$log"
 say ""
-say "collapsed files : $DEST"
-say "done. table: $TSV"
+say "files  $log  $tsv  $raw_dir/"
