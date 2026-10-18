@@ -1,3 +1,4 @@
+// cut_audit.cpp
 // checks that the cut KernelizerMaxflow uses is a real minimum cut, a gate test for the NT classification
 // builds the same double cover network, solves it with the CPU solver and then looks at several source side choices:
 //   STALE      : the heights as the solver left them (from the BFS at the top of the last loop, before the last push and remove)
@@ -215,7 +216,7 @@ int main(int argc, char** argv) {
     const std::vector<int>& h = solver.heights();
     std::vector<char> side(flow_n, 0);
     for (int v = 0; v < flow_n; v++) side[v] = (h[v] >= flow_n) ? 1 : 0;
-    report("STALE heights (what KernelizerMaxflow uses today)", net, side, F, n);
+    report("STALE heights (old rule)", net, side, F, n);
   }
 
   // [FRESH] backward BFS from the sink over the final residuals
@@ -267,7 +268,7 @@ int main(int argc, char** argv) {
       }
     }
     std::cout << "(SEEDED started from " << seeds << " seed vertices)\n";
-    report("SEEDED fwd BFS from source + excess (proposed fix)", net, side, F, n);
+    report("SEEDED fwd BFS from source + excess (rule in use)", net, side, F, n);
   }
 
   // [PHASE2] turn the preflow into a real flow by sending every unit of stranded excess back to the source
