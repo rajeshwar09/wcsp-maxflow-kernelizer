@@ -1,38 +1,23 @@
-// wcsp_collapse -- remove variables that have only one possible value.
+// removes the variables that have only one possible value (domain 1) from a DIMACS .wcsp file
+// the CCG loader refuses any variable whose domain is not exactly 2, but that mixes two different cases:
+//   domain >= 3 : a real multi valued variable, the CCG cannot express it
+//   domain == 1 : not a decision at all, it is a constant and can be substituted away
+// on the published benchmark all 368 refused instances have only domains 1 and 2, on MRF/DBN 73 % of the variables are
+// constants, so a 919 variable instance becomes a 247 variable one
 //
-// NEED
-//   The CCG loader rejects any instance where some variable does not have domain
-//   size exactly 2. That check conflates two very different cases:
+// what it is doing: drops every domain-1 variable, cuts the cost table of every constraint that had one down to the remaining scope,
+// adds a constraint whose whole scope is gone to a fixed constant, and writes a file with only domain-2 variables
+// why correct: a removed variable had only one value, so every solution of the output extends to exactly one solution of the
+// input with the same cost, the optimum changes only by the folded constant (scripts/audit_collapse.py checks this)
 //
-//     domain >= 3 : a multi-valued variable. The CCG cannot express it, and no preprocessing changes that
-//     domain == 1 : a variable with one possible value. That is not a decision at all, it is a constant. Substituting it away is trivially right
+// DIMACS wcsp layout
+//   line 1         : <name> <nvars> <maxdom> <nconstraints> <upperbound>
+//   line 2         : domain size of every variable
+//   per constraint : <arity> <var ...> <defaultcost> <ntuples>, then ntuples lines of <value ...> <cost>
 //
-//   Measured on the published benchmark: 368 instances are rejected, and ALL 368 contain only domains 1 and 2 -- not one has a domain of 3 or more. 
-//   Of those, 160 also have low constraint arity to be usable
-//   On MRF/DBN, 73 % of the variables are constants, so collapsing turns a 919-variable instance into a 247-variable one
-//
-// THIS CODE DO
-//   Reads a DIMACS .wcsp, drops every domain-1 variable, rewrites every constraint that touched one (restricting its cost table to the surviving scope), folds any
-//   constraint whose whole scope disappears into the problem's constant term, and writes a .wcsp containing only domain-2 variables.
-//
-// CORRECTNESS
-//   Every removed variable had exactly one legal value, so every solution of the output extends uniquely to a solution of the input with the same cost
-//   The optimum is therefore unchanged. Verify with:
-//     ./e2e_solve --kernelizer none --solver ilp original.wcsp
-//     ./e2e_solve --kernelizer none --solver ilp collapsed.wcsp
-//   The two FINAL OPTIMUM values must be identical
-//
-// FORMAT (DIMACS wcsp)
-//   line 1 : <name> <nvars> <maxdom> <nconstraints> <upperbound>
-//   line 2 : <domain size of each variable, space separated>
-//   then, per constraint:
-//     <arity> <var...> <defaultcost> <ntuples>
-//     followed by ntuples lines: <value...> <cost>
-//
-// Build:
-//   g++ -std=c++17 -O2 apps/wcsp_collapse.cpp -o wcsp_collapse
-// Usage:
-//   ./wcsp_collapse <in.wcsp> <out.wcsp>
+// build: g++ -std=c++17 -O2 apps/wcsp_collapse.cpp -o wcsp_collapse
+// usage: ./wcsp_collapse <in.wcsp> <out.wcsp>
+// exit codes: 0 done, 1 bad arguments, 2 file not readable or writable, 3 a domain of 3 or more, 4 no domain-1 variable
 
 #include <cstdint>
 #include <fstream>
@@ -50,7 +35,7 @@ int main(int argc, char** argv) {
   std::ifstream in(argv[1]);
   if (!in) { std::cerr << "cannot open " << argv[1] << "\n"; return 2; }
 
-  //  ---- header ----------------------------------------------------------
+  // [HEADER] name, sizes and domains
   std::string name;
   long nvars = 0, maxdom = 0, ncons = 0;
   long long ub = 0;
@@ -59,14 +44,13 @@ int main(int argc, char** argv) {
   std::vector<long> dom(nvars);
   for (long i = 0; i < nvars; i++) in >> dom[i];
 
-  //  ---- decide which variables survive ----------------------------------
-  //  keep[i] is the new index of old variable i, or -1 if it is being removed.
+  // [KEEP] keep[i] is the new number of old variable i, or -1 when it is removed
   std::vector<long> keep(nvars, -1);
   long kept = 0, dropped = 0, bad = 0;
   for (long i = 0; i < nvars; i++) {
     if (dom[i] == 1)      { dropped++; }
     else if (dom[i] == 2) { keep[i] = kept++; }
-    else                  { bad++; }        //  a genuine multi-valued variable
+    else                  { bad++; }        // a real multi valued variable
   }
 
   if (bad > 0) {
@@ -79,9 +63,8 @@ int main(int argc, char** argv) {
     return 4;
   }
 
-  //  ---- rewrite the constraints ------------------------------------------
-  //  A removed variable can only take value 0, so any tuple that assigns it a different value is unreachable and is discarded
-  //  Tuples that assign it 0 are kept, with that position deleted from the tuple
+  // [REWRITE] a removed variable can only take value 0, a tuple with another value for it can never happen and is dropped
+  // tuples with 0 for it are kept, with that position taken out
   struct Constraint {
     std::vector<long>      scope;
     long long              defcost = 0;
@@ -90,7 +73,7 @@ int main(int argc, char** argv) {
   std::vector<Constraint> out;
   out.reserve(ncons);
 
-  long long folded_constant = 0;   //  cost of constraints whose whole scope vanished
+  long long folded_constant = 0;   // cost of the constraints whose whole scope is gone
   long collapsed_whole = 0, shrunk = 0;
 
   for (long c = 0; c < ncons; c++) {
@@ -101,7 +84,7 @@ int main(int argc, char** argv) {
     long long defcost = 0, ntup = 0;
     in >> defcost >> ntup;
 
-    //  which positions of this scope survive
+    // [REWRITE] positions of this scope that stay
     std::vector<long> survivors;
     for (long a = 0; a < arity; a++) if (keep[scope[a]] >= 0) survivors.push_back(a);
 
@@ -115,7 +98,7 @@ int main(int argc, char** argv) {
       long long cost = 0;
       in >> cost;
 
-      //  a removed variable is fixed at value 0; any other value is unreachable
+      // [REWRITE] skip the tuple when a removed variable has a value other than 0
       bool reachable = true;
       for (long a = 0; a < arity; a++)
         if (keep[scope[a]] < 0 && vals[a] != 0) { reachable = false; break; }
@@ -128,7 +111,7 @@ int main(int argc, char** argv) {
     }
 
     if (nc.scope.empty()) {
-      //  every variable in this constraint was a constant, so it contributes a fixed cost: the tuple for the all-zero assignment, or the default
+      // [FOLD] every variable was a constant, the constraint is one fixed cost: the all zero tuple, or the default
       long long cost = nc.tuples.empty() ? defcost : nc.tuples.front().second;
       folded_constant += cost;
       collapsed_whole++;
@@ -138,7 +121,7 @@ int main(int argc, char** argv) {
     out.push_back(std::move(nc));
   }
 
-  //  ---- write ------------------------------------------------------------
+  // [WRITE] the collapsed file, every domain is 2
   std::ofstream o(argv[2]);
   if (!o) { std::cerr << "cannot write " << argv[2] << "\n"; return 2; }
 
@@ -156,6 +139,7 @@ int main(int argc, char** argv) {
     }
   }
 
+  // [REPORT] sizes before and after, the folded constant is not in the output file
   std::cerr << "collapse: " << nvars << " -> " << kept << " variables"
             << "  (" << dropped << " constants removed)\n"
             << "          " << ncons << " -> " << out.size() << " constraints"

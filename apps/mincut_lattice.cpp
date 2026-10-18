@@ -1,24 +1,16 @@
-// Measures how much ANY minimum cut could possibly decide
+// finds the most that any min-cut kernelizer could decide on one instance (the ceiling)
+// after the max-flow, two nodes in the same strongly connected component (SCC) of the residual graph can reach each other
+// along edges that still have capacity, so a cut that puts them on different sides would leave a residual edge crossing it
+// no minimum cut can do that, which gives this test for a CCG vertex v with copies v_L and v_R in the double cover:
+//   SCC(v_L) == SCC(v_R) : same side in every min cut, no min-cut method can decide v
+//   SCC(v_L) != SCC(v_R) : some min cut separates them, v can be decided
+// counting the second case gives the ceiling, comparing it with what our cut rule decides tells if the gap is
+// a selection problem (a better cut exists) or a structural one (nothing more to win)
 //
-// On some instances the max-flow kernelizer resolves 0 variables while the Gurobi LP kernelizer resolves up to 100%
-// cut_audit already showed that the max-flow cut is a genuine minimum cut, and that different min-cuts decide
-// different amounts (SEEDED 0, FRESH 0, STALE 5 on d_m2000)
-//
-// In the residual graph left behind by the max-flow, two nodes in the same strongly connected component are each reachable from the other along edges that still have capacity
-// A cut placing them on opposite sides would leave a residual edge crossing it, which no minimum cut can do
-// That gives a test:
-//
-//   for a CCG vertex v with copies v_L and v_R in the double cover,
-//     SCC(v_L) == SCC(v_R)  ->  they are on the same side in EVERY min-cut, so v is undecidable by any min-cut method
-//     SCC(v_L) != SCC(v_R)  ->  SOME min-cut separates them, so v is decidable in principle
-//
-// Counting the second case gives an exact UPPER BOUND on what any min-cut based kernelizer can achieve on this instance. Comparing that bound with what the
-// current rule actually achieves says whether the gap is a selection problem (fixable) or a structural one (fundamental)
-//
-// Build:
-//   g++ -std=c++17 -O2 -I. apps/mincut_lattice.cpp -o mincut_lattice -lopenblas
-// Usage:
-//   ./mincut_lattice [--format d|u|auto] <file.wcsp|file.uai>
+// build: g++ -std=c++17 -O2 -I. apps/mincut_lattice.cpp -o mincut_lattice -lopenblas
+// usage: ./mincut_lattice [--format d|u|auto] [--max-arity N] <file.wcsp|file.uai>
+// exit codes: 0 done, 1 bad arguments, 2 file not readable, 5 non Boolean or domain-1 variable, 6 arity too high
+// the VERDICT and SCC lines are read by scripts/run_ceiling.sh
 
 #include <algorithm>
 #include <fstream>
@@ -42,7 +34,7 @@ typedef ConstraintCompositeGraph<>::variable_id_t vid_t;
 typedef ConstraintCompositeGraph<>::graph_t graph_t;
 typedef boost::graph_traits<graph_t>::vertex_descriptor vertex_t;
 
-//  Largest constraint scope
+// [ARITY] largest constraint scope of the instance
 template <class Inst>
 static size_t max_constraint_arity(const Inst& inst) {
   size_t m = 0;
@@ -53,7 +45,7 @@ static size_t max_constraint_arity(const Inst& inst) {
   return m;
 }
 
-//  Iterative Tarjan. The double cover reaches tens of millions of nodes, so a recursive implementation would overflow the stack
+// [SCC] Tarjan without recursion, the double cover can have tens of millions of nodes and recursion would overflow the stack
 static void strongly_connected(const flow_network<cap_t>& net, std::vector<int>& comp, int& ncomp) {
   const int N = net.num_nodes;
   comp.assign(N, -1);
@@ -63,7 +55,7 @@ static void strongly_connected(const flow_network<cap_t>& net, std::vector<int>&
   int idx = 0;
   ncomp = 0;
 
-  //  Explicit DFS stack: (vertex, next edge slot to examine)
+  // [SCC] our own DFS stack of (vertex, next edge to look at)
   std::vector<std::pair<vertex_id_t, edge_id_t>> call;
 
   for (vertex_id_t root = 0; root < N; root++) {
@@ -79,7 +71,7 @@ static void strongly_connected(const flow_network<cap_t>& net, std::vector<int>&
 
       if (e < net.offset[u + 1]) {
         edge_id_t cur = e++;
-        //  Only residual edges exist in the residual graph
+        // [SCC] only edges with capacity left belong to the residual graph
         if (net.residual_capacity[cur] <= MAXFLOW_EPSILON) continue;
         vertex_id_t v = net.edge_dst[cur];
         if (index[v] == -1) {
@@ -91,7 +83,7 @@ static void strongly_connected(const flow_network<cap_t>& net, std::vector<int>&
           if (index[v] < low[u]) low[u] = index[v];
         }
       } else {
-        //  u is finished: close a component if it is a root
+        // [SCC] u is finished, if it is a root it closes one component
         if (low[u] == index[u]) {
           while (true) {
             vertex_id_t w = stk.back();
@@ -118,7 +110,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  //  Format is chosen by extension unless --format overrides it.
+  // [ARGS] the format comes from the file extension unless --format is given
   std::string fmt = "auto";
   size_t max_arity = 15;
   const char* path = nullptr;
@@ -145,12 +137,11 @@ int main(int argc, char** argv) {
   std::ifstream in(path);
   if (!in) { std::cerr << "cannot open " << path << "\n"; return 2; }
 
-  //  reasons an instance can be unusable
-  //    domain_error  -> a variable is not Boolean, or is pinned to one value  (rc 5)
-  //    bad_alloc     -> a cost table or polynomial is too large to represent  (rc 6)
-  //  The second shows up as bad_array_new_length: at arity 77 the code computes 2^77
-  //  as an array length, which overflows and is rejected before any allocation is
-  //  attempted. Measured arity on this benchmark reaches 580.
+  // [PARSE] reasons an instance cannot be used
+  //   domain_error : a variable is not Boolean or has only one value       (code 5)
+  //   bad_alloc    : a cost table or polynomial is too large to represent  (code 6)
+  // the second one shows up as bad_array_new_length, at arity 77 the length 2^77 overflows
+  // and is refused before any memory is taken, the arity on this benchmark goes up to 580
   std::unique_ptr<WCSPInstance<>> instp;
   try {
     instp.reset(new WCSPInstance<>(in, fformat));
@@ -168,7 +159,8 @@ int main(int argc, char** argv) {
     return 6;
   }
   WCSPInstance<>& inst = *instp;
-  
+
+  // [ARITY] checked before toPolynomial, which needs 2^(2*arity) doubles
   {
     size_t arity = max_constraint_arity(inst);
     if (arity > max_arity) {
@@ -178,6 +170,7 @@ int main(int argc, char** argv) {
     }
   }
 
+  // [CCG] build and simplify the constraint composite graph
   ConstraintCompositeGraph<> ccg;
   WCSPInstance<>::constraint_t::Polynomial p;
   for (const auto& c : inst.getConstraints()) c.toPolynomial(p);
@@ -186,7 +179,7 @@ int main(int argc, char** argv) {
   ccg.simplify(pre);
   graph_t g = *ccg.getGraph();
 
-  //  Rebuild the double cover exactly as KernelizerMaxflow does
+  // [FLOW] the same double cover network as KernelizerMaxflow builds
   auto vertex_weight_map = boost::get(boost::vertex_weight, g);
   std::vector<vertex_t> ccg_vertices;
   std::map<vertex_t, int> vertex_index;
@@ -233,6 +226,7 @@ int main(int argc, char** argv) {
   static_max_flow_solver<cap_t> solver(net);
   cap_t F = solver.solve();
 
+  // [OUTPUT] instance and flow numbers
   std::cout << "=== INSTANCE ===\n";
   std::cout << "  file                 : " << path << "\n";
   std::cout << "  format               : " << (fformat == WCSPInstance<>::Format::UAI ? "uai" : "dimacs") << "\n";
@@ -244,7 +238,7 @@ int main(int argc, char** argv) {
   std::cout << "  max-flow             : " << F << "\n";
   std::cout << "  LP optimum (= F/2)   : " << (F / 2) << "\n\n";
 
-  //  The all-half assignment costs W/2. If that equals the LP optimum F/2, then all-half is itself optimal and the symmetric min-cut is a valid answer
+  // [ALLHALF] the all-half assignment costs W/2, if that equals the LP optimum F/2 then all-half is optimal and the symmetric cut is a valid answer
   std::cout << "=== ALL-HALF TEST ===\n";
   bool allhalf = (F >= total_weight - MAXFLOW_EPSILON);
   std::cout << "  max-flow vs W        : " << F << " vs " << total_weight << "\n";
@@ -254,8 +248,7 @@ int main(int argc, char** argv) {
       : "the all-half solution is NOT optimal; a min-cut must decide something")
       << "\n\n";
 
-  //  Nodes sharing a strongly connected component of the residual graph fall on the same side of EVERY minimum cut, so counting the pairs that do NOT share one
-  //  gives the exact ceiling for any min-cut based method
+  // [SCC] pairs in the same SCC are on the same side of every min cut, the pairs in different SCCs give the ceiling
   std::vector<int> comp;
   int ncomp = 0;
   strongly_connected(net, comp, ncomp);
@@ -272,7 +265,7 @@ int main(int argc, char** argv) {
   std::cout << "  pairs in DIFFERENT SCCs     : " << diff
             << "  (" << (100.0 * diff / n) << "%)  <- decidable by SOME min-cut\n\n";
 
-  //  What the rule currently in use actually achieves, for comparison.
+  // [GAP] what our cut rule decides, to compare with the ceiling
   long decided_now = 0;
   for (int i = 0; i < n; i++) {
     bool L = solver.is_on_source_side(i + 1);
@@ -287,6 +280,7 @@ int main(int argc, char** argv) {
             << "  (" << (100.0 * diff / n) << "%)\n";
   std::cout << "  recoverable by better choice: " << (diff - decided_now) << "\n\n";
 
+  // [VERDICT] STRUCTURAL, SELECTION or OPTIMAL
   std::cout << "  VERDICT: ";
   if (diff == 0) {
     std::cout << "STRUCTURAL. No min-cut can decide anything on this instance.\n"

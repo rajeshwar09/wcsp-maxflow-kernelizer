@@ -1,12 +1,9 @@
-// Runs BOTH max-flow kernelizers (CPU and GPU) on the same CCG built from one
-// .wcsp file, then compares the resulting assignments variable by variable.
-//
-// This answers: when the CPU and GPU kernelizers resolve different NUMBERS of
-// variables, is that because the vertex-cover LP has several optimal solutions
-// (different but equally valid min-cuts), or because one of them assigns a
-// variable the WRONG value?
-//
-// Usage: ./compare_kernels_gpu <file.wcsp>
+// gate test: runs the CPU and the GPU max-flow kernelizers on the same CCG from one .wcsp file
+// and compares their assignments variable by variable
+// a different count is fine (the LP can have more than one optimum, so more than one valid min cut),
+// a variable with opposite values means one of the two kernels is wrong
+// build: made by ./scripts/build.sh gates (needs nvcc)
+// usage: ./compare_kernels_gpu <file.wcsp>
 
 #include <iostream>
 #include <fstream>
@@ -19,6 +16,7 @@
 
 typedef ConstraintCompositeGraph<>::variable_id_t vid_t;
 
+// [CCG] builds the CCG of the file and simplifies it, pre gets the variables fixed by simplify
 static void build(const char* path, ConstraintCompositeGraph<>::graph_t& g, std::map<vid_t,bool>& pre) {
   std::ifstream in(path);
   if (!in) { std::cerr << "cannot open " << path << "\n"; std::exit(2); }
@@ -34,6 +32,7 @@ static void build(const char* path, ConstraintCompositeGraph<>::graph_t& g, std:
 int main(int argc, char** argv) {
   if (argc < 2) { std::cerr << "usage: " << argv[0] << " <file.wcsp>\n"; return 1; }
 
+  // [RUN] CPU then GPU kernelizer, each on its own fresh CCG
   std::map<vid_t,bool> a_cpu, a_gpu;
   {
     ConstraintCompositeGraph<>::graph_t g;
@@ -52,6 +51,7 @@ int main(int argc, char** argv) {
     kgpu.kernelize(g, a_gpu);
   }
 
+  // [COMPARE] decided by one side only, by both with the same value, by both with opposite values
   size_t only_cpu = 0, only_gpu = 0, agree = 0, conflict = 0;
   for (const auto& kv : a_cpu) {
     auto it = a_gpu.find(kv.first);
