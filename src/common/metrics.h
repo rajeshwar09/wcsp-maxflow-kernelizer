@@ -1,5 +1,4 @@
-// one global store for the numbers a run produces (times, counts, memory)
-// every value is printed at the end as "[m] name : value" so the scripts can pick up new values without any change
+// one global store for the numbers a run produces (times, counts, memory) every value is printed at the end as "[m] name : value" so the scripts can pick up new values without any change
 // usage:
 //   double t = now_sec();
 //   (the work to time)
@@ -54,6 +53,12 @@ namespace maxflow {
         } else if (v > *p) {
           *p = v;
         }
+      }
+
+      // [METRICS] current value of a name, 0 when it was never set
+      double value(const std::string& name) {
+        double* p = find(name);
+        return p == nullptr ? 0.0 : *p;
       }
 
       // [METRICS] print every value, one per line

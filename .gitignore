@@ -10,6 +10,7 @@
 /cut_audit
 /compare_kernels
 /compare_kernels_gpu
+/gpu_tune
 *.o
 build/
 third_party/**/build/

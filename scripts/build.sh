@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# build.sh
 # compiles the programs of the project into the repo folder
 # usage:
 #   ./scripts/build.sh                    core and gates
 #   ./scripts/build.sh core               e2e_solve, e2e_solve_gpu, mincut_lattice, wcsp_collapse
-#   ./scripts/build.sh gates              kmf_test, cut_audit, compare_kernels, compare_kernels_gpu
+#   ./scripts/build.sh gates              kmf_test, cut_audit, compare_kernels, compare_kernels_gpu, gpu_tune
 #   ./scripts/build.sh --arch sm_89 core  force the GPU architecture instead of asking nvidia-smi
 # Gurobi is used when GUROBI_HOME points to it, without Gurobi the lp kernelizer and the ilp solver are not built in
 # the compiler output of every build is kept in results/<date>/build_<time>.log
@@ -96,8 +95,10 @@ if [ "$what" = "gates" ] || [ "$what" = "all" ]; then
   fi
   if [ -n "$arch" ]; then
     compile compare_kernels_gpu nvcc -x cu -std=c++17 -O2 -arch="$arch" -I. apps/compare_kernels_gpu.cu -o compare_kernels_gpu -lopenblas
+    compile gpu_tune nvcc -x cu -std=c++17 -O2 -arch="$arch" -lineinfo -I. apps/gpu_tune.cu -o gpu_tune -lopenblas
   else
     skip compare_kernels_gpu "no nvcc or no GPU"
+    skip gpu_tune "no nvcc or no GPU"
   fi
 fi
 
