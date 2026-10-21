@@ -42,7 +42,7 @@ namespace maxflow {
     bool bfs_split = true;      // fix D, BFS levels also split into thread, warp and block kernels
     int block_threads = 0;      // fix D2, threads per block for big vertices, 0 = chosen from the largest vertex
     bool async = true;          // fix E, wait for the GPU only once per pass
-    int gr_period = 400;        // passes between two global relabels
+    int gr_period = 75;         // passes between two global relabels
     int kernel_cycles = 0;      // push or relabel steps per vertex in one pass, 0 = |E|/|V|
     bool kernel_times = false;  // time each step of the loop, adds waits so only for testing
   };
@@ -536,7 +536,7 @@ namespace maxflow {
         int blocks_max = (std::max(V, E) + threads - 1) / threads;
 
         int kernel_cycles = st.kernel_cycles > 0 ? st.kernel_cycles : std::max(1, E / std::max(1, V));
-        int gr_period = st.gr_period > 0 ? st.gr_period : 400;
+        int gr_period = st.gr_period > 0 ? st.gr_period : 75;
 
         // [SETTINGS] degree thresholds, a list that would stay empty is switched off
         int hub_deg = std::max(0, st.hub_deg);

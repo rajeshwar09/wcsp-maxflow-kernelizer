@@ -23,7 +23,7 @@
 //   --bfs-split 0|1                 fix D, split BFS levels by degree     (default 1)
 //   --block-threads N               fix D2, threads per block             (default 0 = automatic)
 //   --async 0|1                     fix E, one wait per pass              (default 1)
-//   --gr-period N                   passes between global relabels        (default 400)
+//   --gr-period N                   passes between global relabels        (default 75)
 //   --kernel-cycles N               push steps per vertex per pass        (default 0 = |E|/|V|)
 //   --gpu-kernel-times              time each step of the GPU loop, slower, only for testing
 //
@@ -145,7 +145,7 @@ static int run(int argc, char** argv) {
   int g_bfs_split = 1;
   int g_block_threads = 0;
   int g_async = 1;
-  int g_gr_period = 400;
+  int g_gr_period = 75;
   int g_kernel_cycles = 0;
   bool g_kernel_times = false;
 

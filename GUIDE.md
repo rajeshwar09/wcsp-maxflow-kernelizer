@@ -208,7 +208,7 @@ These change the GPU solver, they only matter with `--kernelizer gpu`. The defau
 | `--bfs-split 0\|1` | 1 | fix D, each BFS level split into small, hub and block kernels |
 | `--block-threads N` | 0 | fix D2, threads per block, 0 = chosen from the largest vertex (256, 512 or 1024) |
 | `--async 0\|1` | 1 | fix E, one wait for the GPU per pass instead of one after every step |
-| `--gr-period N` | 400 | passes between two global relabels (BFS from the sink) |
+| `--gr-period N` | 75 | passes between two global relabels (BFS from the sink) |
 | `--kernel-cycles N` | 0 | push steps per vertex in one launch, 0 = edges / vertices |
 | `--gpu-kernel-times` | off | time every step of the GPU loop. It adds waits, so the total gets slower, use it only for testing |
 

@@ -8,7 +8,7 @@
 //   --hub-list L          values of hub_deg, comma list                   (default 0,16,32,64,128,256)
 //   --block-list L        values of block_deg                             (default 0,256,512,1024,2048,4096)
 //   --threads-list L      values of block_threads, 0 = automatic          (default 0,256,512,1024)
-//   --gr-list L           values of gr_period                             (default 100,200,400,800,1600)
+//   --gr-list L           values of gr_period                             (default 25,50,75,100,150,400)
 //   --max-arity N         skip instances with a wider constraint          (default 15)
 //
 // output lines, read by scripts/run_tune.sh:
@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
   std::vector<int> hub_list = {0, 16, 32, 64, 128, 256};
   std::vector<int> block_list = {0, 256, 512, 1024, 2048, 4096};
   std::vector<int> threads_list = {0, 256, 512, 1024};
-  std::vector<int> gr_list = {100, 200, 400, 800, 1600};
+  std::vector<int> gr_list = {25, 50, 75, 100, 150, 400};
   const char* path = nullptr;
 
   // [ARGS] read the command line
