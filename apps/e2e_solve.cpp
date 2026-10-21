@@ -24,6 +24,8 @@
 //   --block-threads N               fix D2, threads per block             (default 0 = automatic)
 //   --async 0|1                     fix E, one wait per pass              (default 1)
 //   --gr-period N                   passes between global relabels        (default 75)
+//   --gr-work N                     automatic relabel when active work since the last reaches N/1000 x |V| (default 0 = off)
+//   --gr-sqrt N                     automatic relabel when passes x active work since the last reaches N x |V| (default 0 = off)
 //   --kernel-cycles N               push steps per vertex per pass        (default 0 = |E|/|V|)
 //   --gpu-kernel-times              time each step of the GPU loop, slower, only for testing
 //
@@ -118,7 +120,7 @@ static void usage(const char* prog) {
             << "  --max-rounds N   --max-arity N   --time-limit SEC\n"
             << "  --perturb off|int|real   --spread K   --delta D   --seed S\n"
             << "  gpu: --sink-bfs 0|1 --hub-deg N --block-deg N --bfs-split 0|1 --block-threads N\n"
-            << "       --async 0|1 --gr-period N --kernel-cycles N --gpu-kernel-times\n"
+            << "       --async 0|1 --gr-period N --gr-work N --gr-sqrt N --kernel-cycles N --gpu-kernel-times\n"
             << "  see the comment at the top of apps/e2e_solve.cpp for details\n";
 }
 
@@ -146,6 +148,8 @@ static int run(int argc, char** argv) {
   int g_block_threads = 0;
   int g_async = 1;
   int g_gr_period = 75;
+  int g_gr_work = 0;
+  int g_gr_sqrt = 0;
   int g_kernel_cycles = 0;
   bool g_kernel_times = false;
 
@@ -170,6 +174,8 @@ static int run(int argc, char** argv) {
     else if (a == "--block-threads" && has_val) g_block_threads = std::atoi(argv[++i]);
     else if (a == "--async" && has_val) g_async = std::atoi(argv[++i]);
     else if (a == "--gr-period" && has_val) g_gr_period = std::atoi(argv[++i]);
+    else if (a == "--gr-work" && has_val) g_gr_work = std::atoi(argv[++i]);
+    else if (a == "--gr-sqrt" && has_val) g_gr_sqrt = std::atoi(argv[++i]);
     else if (a == "--kernel-cycles" && has_val) g_kernel_cycles = std::atoi(argv[++i]);
     else if (a == "--gpu-kernel-times") g_kernel_times = true;
     else if (a == "-h" || a == "--help") {
@@ -250,6 +256,8 @@ static int run(int argc, char** argv) {
   gs.block_threads = g_block_threads;
   gs.async = (g_async != 0);
   gs.gr_period = g_gr_period;
+  gs.gr_work = g_gr_work;
+  gs.gr_sqrt = g_gr_sqrt;
   gs.kernel_cycles = g_kernel_cycles;
   gs.kernel_times = g_kernel_times;
 #endif
@@ -274,7 +282,7 @@ static int run(int argc, char** argv) {
   if (kern == "gpu") {
     std::cout << "[info] gpu : sink_bfs=" << g_sink_bfs << " hub_deg=" << g_hub_deg << " block_deg=" << g_block_deg
               << " bfs_split=" << g_bfs_split << " block_threads=" << g_block_threads << " async=" << g_async
-              << " gr_period=" << g_gr_period << " kernel_cycles=" << g_kernel_cycles << " kernel_times=" << g_kernel_times << "\n";
+              << " gr_period=" << g_gr_period << " gr_work=" << g_gr_work << " gr_sqrt=" << g_gr_sqrt << " kernel_cycles=" << g_kernel_cycles << " kernel_times=" << g_kernel_times << "\n";
   }
   if (pcfg_base.mode != maxflow::perturb_mode::off && (kern == "lp" || kern == "none")) {
     std::cout << "[info] note : --perturb has no effect with --kernelizer " << kern << "\n";

@@ -209,6 +209,8 @@ These change the GPU solver, they only matter with `--kernelizer gpu`. The defau
 | `--block-threads N` | 0 | fix D2, threads per block, 0 = chosen from the largest vertex (256, 512 or 1024) |
 | `--async 0\|1` | 1 | fix E, one wait for the GPU per pass instead of one after every step |
 | `--gr-period N` | 75 | passes between two global relabels (BFS from the sink) |
+| `--gr-work N` | 0 | automatic relabel: when the active vertices since the last relabel reach N/1000 x V, 0 = off |
+| `--gr-sqrt N` | 0 | automatic relabel: when (passes x active vertices) since the last relabel reach N x V, 0 = off |
 | `--kernel-cycles N` | 0 | push steps per vertex in one launch, 0 = edges / vertices |
 | `--gpu-kernel-times` | off | time every step of the GPU loop. It adds waits, so the total gets slower, use it only for testing |
 

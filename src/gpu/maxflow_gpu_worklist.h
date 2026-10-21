@@ -43,6 +43,8 @@ namespace maxflow {
     int block_threads = 0;      // fix D2, threads per block for big vertices, 0 = chosen from the largest vertex
     bool async = true;          // fix E, wait for the GPU only once per pass
     int gr_period = 75;         // passes between two global relabels
+    int gr_work = 0;            // automatic relabel, when the active vertices since the last one reach gr_work / 1000 x |V|, 0 = off
+    int gr_sqrt = 0;            // automatic relabel, when passes x active vertices since the last one reach gr_sqrt x |V|, 0 = off
     int kernel_cycles = 0;      // push or relabel steps per vertex in one pass, 0 = |E|/|V|
     bool kernel_times = false;  // time each step of the loop, adds waits so only for testing
   };
@@ -705,6 +707,8 @@ namespace maxflow {
         long passes = 0;
         long relabels = 0;
         long active_sum = 0;
+        long since_passes = 0;
+        long since_active = 0;
         int outer_iter = 0;
         bool heights_fresh = false;
         while (true) {
@@ -722,10 +726,21 @@ namespace maxflow {
           }
 
           bool do_relabel = (outer_iter % gr_period == 0);
+
+          // [RELABEL-AUTO] the work since the last relabel decides instead of a fixed pass count
+          // many active vertices per pass make the heights old quickly, so the relabel comes sooner
+          if (st.gr_work > 0) {
+            do_relabel = (outer_iter == 0) || (1000.0 * since_active >= (double)st.gr_work * V);
+          } else if (st.gr_sqrt > 0) {
+            do_relabel = (outer_iter == 0) || ((double)since_passes * since_active >= (double)st.gr_sqrt * V);
+          }
+
           heights_fresh = do_relabel;
           if (do_relabel) {
             global_relabel();
             relabels++;
+            since_passes = 0;
+            since_active = 0;
             step_time("time.gpu.k_bfs");
             // [LOOP] the relabel can make vertices inactive, so build the lists again
             if (work_size > 0) {
@@ -735,8 +750,9 @@ namespace maxflow {
           }
 
           if (work_size > 0) {
-            // [COUNT] active vertices of this pass, summed over all passes
+            // [COUNT] active vertices of this pass, summed over all passes and since the last relabel
             active_sum += work_size;
+            since_active += work_size;
 
             // [PUSH] one launch per list, thread, warp or block per vertex
             if (small_size > 0) {
@@ -765,6 +781,7 @@ namespace maxflow {
             step_time("time.gpu.k_remove");
           }
           outer_iter++;
+          since_passes++;
         }
 
         // [COUNT] loop counters, summed over kernelization rounds

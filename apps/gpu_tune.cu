@@ -9,6 +9,8 @@
 //   --block-list L        values of block_deg                             (default 0,256,512,1024,2048,4096)
 //   --threads-list L      values of block_threads, 0 = automatic          (default 0,256,512,1024)
 //   --gr-list L           values of gr_period                             (default 25,50,75,100,150,400)
+//   --work-list L         values of gr_work, automatic relabel             (default 10,20,30,50,80)
+//   --sqrt-list L         values of gr_sqrt, automatic relabel             (default 1,2,4,6,9,16)
 //   --max-arity N         skip instances with a wider constraint          (default 15)
 //
 // output lines, read by scripts/run_tune.sh:
@@ -108,6 +110,8 @@ int main(int argc, char** argv) {
   std::vector<int> block_list = {0, 256, 512, 1024, 2048, 4096};
   std::vector<int> threads_list = {0, 256, 512, 1024};
   std::vector<int> gr_list = {25, 50, 75, 100, 150, 400};
+  std::vector<int> work_list = {10, 20, 30, 50, 80};
+  std::vector<int> sqrt_list = {1, 2, 4, 6, 9, 16};
   const char* path = nullptr;
 
   // [ARGS] read the command line
@@ -119,6 +123,8 @@ int main(int argc, char** argv) {
     else if (a == "--block-list" && has_val) block_list = parse_list(argv[++i]);
     else if (a == "--threads-list" && has_val) threads_list = parse_list(argv[++i]);
     else if (a == "--gr-list" && has_val) gr_list = parse_list(argv[++i]);
+    else if (a == "--work-list" && has_val) work_list = parse_list(argv[++i]);
+    else if (a == "--sqrt-list" && has_val) sqrt_list = parse_list(argv[++i]);
     else if (a == "--max-arity" && has_val) max_arity = std::atol(argv[++i]);
     else if (a[0] == '-') {
       std::cerr << "unknown option: " << a << "\n";
@@ -216,7 +222,8 @@ int main(int argc, char** argv) {
   gpu_settings& st = gpu_config();
   const gpu_settings defaults = st;
   std::cout << "[info] defaults : hub_deg=" << defaults.hub_deg << " block_deg=" << defaults.block_deg
-            << " block_threads=" << defaults.block_threads << " gr_period=" << defaults.gr_period << "\n";
+            << " block_threads=" << defaults.block_threads << " gr_period=" << defaults.gr_period
+            << " gr_work=" << defaults.gr_work << " gr_sqrt=" << defaults.gr_sqrt << "\n";
 
   // [WARMUP] untimed runs with the defaults, at least 5 runs and 1 second, the first runs after a pause are slower
   // the first run also gives the reference answer
@@ -244,6 +251,8 @@ int main(int argc, char** argv) {
     {"block_deg", &st.block_deg, block_list},
     {"block_threads", &st.block_threads, threads_list},
     {"gr_period", &st.gr_period, gr_list},
+    {"gr_work", &st.gr_work, work_list},
+    {"gr_sqrt", &st.gr_sqrt, sqrt_list},
   };
 
   // [SWEEP] flat list of the settings to measure, the default value of a knob is skipped, the "default" row already has it
