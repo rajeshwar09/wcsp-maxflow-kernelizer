@@ -704,6 +704,7 @@ namespace maxflow {
         // [LOOP] each pass: build lists, maybe relabel, push-relabel, remove invalid edges
         long passes = 0;
         long relabels = 0;
+        long active_sum = 0;
         int outer_iter = 0;
         bool heights_fresh = false;
         while (true) {
@@ -734,6 +735,9 @@ namespace maxflow {
           }
 
           if (work_size > 0) {
+            // [COUNT] active vertices of this pass, summed over all passes
+            active_sum += work_size;
+
             // [PUSH] one launch per list, thread, warp or block per vertex
             if (small_size > 0) {
               wl_push_relabel_kernel<<<(small_size + threads - 1) / threads, threads>>>(small_size, V, kernel_cycles, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
@@ -767,6 +771,9 @@ namespace maxflow {
         metrics::get().add("gpu.passes", passes);
         metrics::get().add("gpu.relabels", relabels);
         metrics::get().add("gpu.bfs_levels", bfs_levels);
+        metrics::get().add("gpu.active_sum", active_sum);
+        metrics::get().keep_max("gpu.nodes", V);
+        metrics::get().keep_max("gpu.half_edges", E);
         t_solve = mark("time.gpu.solve", t_solve);
 
         // [COPY] flow value and the residual graph back to the host
