@@ -9,6 +9,8 @@
 //   --block-list L        values of block_deg                             (default 0,256,512,1024,2048,4096)
 //   --threads-list L      values of block_threads, 0 = automatic          (default 0,256,512,1024)
 //   --gr-list L           values of gr_period                             (default 25,50,75,100,150,400)
+//   --cycles-list L       values of kernel_cycles, 0 = |E|/|V|            (default 1,2,4,8,16,32,64)
+//   --knobs L             only sweep these knobs, comma list of names     (default all: hub_deg,block_deg,block_threads,gr_period,kernel_cycles)
 //   --max-arity N         skip instances with a wider constraint          (default 15)
 //
 // output lines, read by scripts/run_tune.sh:
@@ -65,6 +67,19 @@ static std::vector<int> parse_list(const std::string& s) {
   return out;
 }
 
+// [ARGS] "hub_deg,gr_period" to a list of names
+static std::vector<std::string> parse_names(const std::string& s) {
+  std::vector<std::string> out;
+  std::stringstream ss(s);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    if (!item.empty()) {
+      out.push_back(item);
+    }
+  }
+  return out;
+}
+
 // [OUTPUT] a number with a fixed count of decimals
 static std::string fix(double v, int decimals) {
   char buf[64];
@@ -108,6 +123,8 @@ int main(int argc, char** argv) {
   std::vector<int> block_list = {0, 256, 512, 1024, 2048, 4096};
   std::vector<int> threads_list = {0, 256, 512, 1024};
   std::vector<int> gr_list = {25, 50, 75, 100, 150, 400};
+  std::vector<int> cycles_list = {1, 2, 4, 8, 16, 32, 64};
+  std::vector<std::string> knob_names;
   const char* path = nullptr;
 
   // [ARGS] read the command line
@@ -119,6 +136,8 @@ int main(int argc, char** argv) {
     else if (a == "--block-list" && has_val) block_list = parse_list(argv[++i]);
     else if (a == "--threads-list" && has_val) threads_list = parse_list(argv[++i]);
     else if (a == "--gr-list" && has_val) gr_list = parse_list(argv[++i]);
+    else if (a == "--cycles-list" && has_val) cycles_list = parse_list(argv[++i]);
+    else if (a == "--knobs" && has_val) knob_names = parse_names(argv[++i]);
     else if (a == "--max-arity" && has_val) max_arity = std::atol(argv[++i]);
     else if (a[0] == '-') {
       std::cerr << "unknown option: " << a << "\n";
@@ -216,7 +235,10 @@ int main(int argc, char** argv) {
   gpu_settings& st = gpu_config();
   const gpu_settings defaults = st;
   std::cout << "[info] defaults : hub_deg=" << defaults.hub_deg << " block_deg=" << defaults.block_deg
-            << " block_threads=" << defaults.block_threads << " gr_period=" << defaults.gr_period << "\n";
+            << " block_threads=" << defaults.block_threads << " gr_period=" << defaults.gr_period
+            << " kernel_cycles=" << defaults.kernel_cycles << "\n";
+  // [DEFAULTS] kernel_cycles 0 means |E|/|V|, same rule as the solver
+  std::cout << "[info] kernel_cycles_auto : " << std::max(1, net.num_edges / std::max(1, net.num_nodes)) << "\n";
 
   // [WARMUP] untimed runs with the defaults, at least 5 runs and 1 second, the first runs after a pause are slower
   // the first run also gives the reference answer
@@ -244,7 +266,29 @@ int main(int argc, char** argv) {
     {"block_deg", &st.block_deg, block_list},
     {"block_threads", &st.block_threads, threads_list},
     {"gr_period", &st.gr_period, gr_list},
+    {"kernel_cycles", &st.kernel_cycles, cycles_list},
   };
+
+  // [SWEEP] with --knobs keep only the named knobs, the "default" row always stays
+  if (!knob_names.empty()) {
+    for (const std::string& name : knob_names) {
+      bool known = false;
+      for (const knob& k : knobs) {
+        known = known || (k.field != nullptr && k.name == name);
+      }
+      if (!known) {
+        std::cerr << "unknown knob in --knobs: " << name << "\n";
+        return 1;
+      }
+    }
+    std::vector<knob> kept;
+    for (const knob& k : knobs) {
+      if (k.field == nullptr || std::find(knob_names.begin(), knob_names.end(), k.name) != knob_names.end()) {
+        kept.push_back(k);
+      }
+    }
+    knobs = kept;
+  }
 
   // [SWEEP] flat list of the settings to measure, the default value of a knob is skipped, the "default" row already has it
   struct setting {
