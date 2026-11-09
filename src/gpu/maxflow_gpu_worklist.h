@@ -214,8 +214,12 @@ namespace maxflow {
 
   // [CAND] incremental worklist, only the candidates of the last pass are tested, same test and lists as the full scan
   // the grid is fixed, so each thread loops over its share of the candidates
-  __global__ void wl_filter_candidates_kernel(const int* cand_count, const int* cand, int num_nodes, int source, int sink, int hub_deg, int block_deg, const int* offset, const cap_t* excess, const int* height, int* worklist, int* hub_list, int* big_list, int* counts) {
+  // cand_total sums the candidates on the GPU for the metric, so the CPU does not have to copy the count every pass
+  __global__ void wl_filter_candidates_kernel(const int* cand_count, const int* cand, int num_nodes, int source, int sink, int hub_deg, int block_deg, const int* offset, const cap_t* excess, const int* height, int* worklist, int* hub_list, int* big_list, int* counts, unsigned long long* cand_total) {
     int n = *cand_count;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      *cand_total += n;
+    }
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
       int u = cand[i];
       if (wl_is_active(u, num_nodes, source, sink, excess, height)) {
@@ -535,8 +539,8 @@ namespace maxflow {
         dev_alloc(&d_worklist, V);
         dev_alloc(&d_counts, 3);
 
-        // [ALLOC] small pinned host buffer for the list sizes, the BFS flag and the candidate count, copies to it are direct
-        MAXFLOW_CUDA_CHECK(cudaMallocHost(&h_pinned, 5 * sizeof(int)));
+        // [ALLOC] small pinned host buffer for the list sizes and the BFS flag, copies to it are direct
+        MAXFLOW_CUDA_CHECK(cudaMallocHost(&h_pinned, 4 * sizeof(int)));
 
         // [COPY] graph to the device
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_offset, net.offset.data(), (V + 1) * sizeof(int), cudaMemcpyHostToDevice));
@@ -565,6 +569,7 @@ namespace maxflow {
         cudaFree(d_mark);
         cudaFree(d_cand);
         cudaFree(d_cand_count);
+        cudaFree(d_cand_total);
         cudaFreeHost(h_pinned);
       }
 
@@ -667,7 +672,9 @@ namespace maxflow {
           dev_alloc(&d_mark, V);
           dev_alloc(&d_cand, V);
           dev_alloc(&d_cand_count, 1);
+          dev_alloc(&d_cand_total, 1);
           MAXFLOW_CUDA_CHECK(cudaMemset(d_mark, 0, V * sizeof(int)));
+          MAXFLOW_CUDA_CHECK(cudaMemset(d_cand_total, 0, sizeof(unsigned long long)));
         }
         int blocks_f = std::min(blocks_v, 160);  // filter loops over the candidates, so a small fixed grid is enough
 
@@ -729,19 +736,16 @@ namespace maxflow {
         };
 
         // [CAND] incremental worklist, same three lists built from the candidates of the last pass only
-        long cand_sum = 0;
         auto filter_lists = [&]() {
           MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_counts, 0, 3 * sizeof(int)));
-          wl_filter_candidates_kernel<<<blocks_f, threads>>>(d_cand_count, d_cand, V, net.source, net.sink, hub_deg, block_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_big_list, d_counts);
+          wl_filter_candidates_kernel<<<blocks_f, threads>>>(d_cand_count, d_cand, V, net.source, net.sink, hub_deg, block_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_big_list, d_counts, d_cand_total);
           MAXFLOW_CUDA_CHECK(cudaGetLastError());
           MAXFLOW_CUDA_CHECK(cudaMemcpyAsync(h_pinned, d_counts, 3 * sizeof(int), cudaMemcpyDeviceToHost));
-          MAXFLOW_CUDA_CHECK(cudaMemcpyAsync(h_pinned + 4, d_cand_count, sizeof(int), cudaMemcpyDeviceToHost));
           MAXFLOW_CUDA_CHECK(cudaStreamSynchronize(0));
           small_size = h_pinned[0];
           hub_size = h_pinned[1];
           big_size = h_pinned[2];
           work_size = small_size + hub_size + big_size;
-          cand_sum += h_pinned[4];
         };
 
         // [BFS] global relabel, one BFS level per launch until no new vertex is reached
@@ -858,7 +862,9 @@ namespace maxflow {
         metrics::get().add("gpu.bfs_levels", bfs_levels);
         metrics::get().add("gpu.active_sum", active_sum);
         if (incremental) {
-          metrics::get().add("gpu.cand_sum", cand_sum);
+          unsigned long long cand_total = 0;
+          MAXFLOW_CUDA_CHECK(cudaMemcpy(&cand_total, d_cand_total, sizeof(cand_total), cudaMemcpyDeviceToHost));
+          metrics::get().add("gpu.cand_sum", static_cast<double>(cand_total));
         }
         metrics::get().keep_max("gpu.nodes", V);
         metrics::get().keep_max("gpu.half_edges", E);
@@ -902,7 +908,8 @@ namespace maxflow {
       int* d_mark = nullptr;          // incremental worklist, last pass in which the vertex was added
       int* d_cand = nullptr;          // incremental worklist, candidates of the next pass
       int* d_cand_count = nullptr;
-      int* h_pinned = nullptr;   // [0..2] list sizes, [3] BFS flag, [4] candidates
+      unsigned long long* d_cand_total = nullptr;  // incremental worklist, candidates summed over all passes
+      int* h_pinned = nullptr;   // [0..2] list sizes, [3] BFS flag
 
       size_t alloc_bytes = 0;
       size_t free_before = 0;
