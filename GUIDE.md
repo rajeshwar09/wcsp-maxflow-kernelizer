@@ -212,6 +212,7 @@ These change the GPU solver, they only matter with `--kernelizer gpu`. The defau
 | `--kernel-cycles N` | 0 | push steps per vertex in one launch, 0 = edges / vertices |
 | `--gpu-kernel-times` | off | time every step of the GPU loop. It adds waits, so the total gets slower, use it only for testing |
 | `--early-gpu-start 0\|1` | 1 | start the GPU (CUDA context) in a background thread while the file is read, so it is ready when the kernelization starts |
+| `--incremental-worklist 0\|1` | 1 | build the list of the next pass from the vertices that got flow instead of a scan of all vertices, 0 = scan every pass |
 
 ### Output
 
@@ -265,6 +266,7 @@ Times are in seconds, memory in MB.
 | `time.gpu.solve`, `time.gpu.result` | GPU max-flow and copy of the result back |
 | `time.gpu.k_build`, `time.gpu.k_bfs`, `time.gpu.k_push`, `time.gpu.k_remove` | per step times, only with `--gpu-kernel-times` |
 | `gpu.block_threads` | threads per block used |
+| `gpu.cand_sum` | candidates looked at by the incremental worklist, summed over all passes (compare with `gpu.nodes` times `gpu.passes`) |
 | `gpu.passes`, `gpu.relabels`, `gpu.bfs_levels` | loop passes, global relabels and BFS levels of the GPU solver |
 | `mem.gpu_alloc_mb` | GPU memory the solver asked for with cudaMalloc |
 | `mem.gpu_solver_mb` | drop of free GPU memory while the solver ran |
@@ -509,14 +511,15 @@ mincut_lattice is not a pass or fail test, it gives the ceiling of one instance:
 
 ## 9. The GPU solver in short
 
-The GPU solver is a push-relabel max-flow. Every pass only the active vertices (excess > 0) get threads (worklist version). Every `--gr-period` passes a global relabel (backward BFS from the sink) sets the heights again.
+The GPU solver is a push-relabel max-flow. Every pass only the active vertices (excess > 0) get threads (worklist version). The list of the next pass is collected from the vertices that got flow in this pass (incremental worklist), a scan of all vertices is only done in the first pass and after a global relabel. Every `--gr-period` passes a global relabel (backward BFS from the sink) sets the heights again.
 
 | kernel | step |
 |---|---|
 | `gpu_initialize_kernel`, `gpu_saturate_source_kernel` | start: reset the network, push all source edges |
 | `gpu_bfs_init_kernel`, `gpu_bfs_sink_level_kernel`, `gpu_bfs_step_kernel` | global relabel, level 0 and the plain BFS step |
 | `wl_bfs_step_small_kernel`, `wl_bfs_step_hub_kernel`, `wl_bfs_step_block_kernel` | BFS level split by vertex size (fix D) |
-| `wl_build_worklist_kernel` | list of active vertices, split into small, hub and big |
+| `wl_build_worklist_kernel` | list of active vertices from a scan of all vertices, split into small, hub and big |
+| `wl_filter_candidates_kernel` | same lists, but only from the candidates the push and remove kernels collected (incremental worklist) |
 | `wl_push_relabel_kernel`, `wl_push_relabel_hub_kernel`, `wl_push_relabel_block_kernel` | push or relabel, one thread, one warp or one block per vertex (fixes B and C) |
 | `wl_remove_invalid_edges_kernel`, `wl_remove_invalid_hub_kernel`, `wl_remove_invalid_block_kernel` | fix edges that broke the height rule |
 

@@ -27,6 +27,7 @@
 //   --kernel-cycles N               push steps per vertex per pass        (default 0 = |E|/|V|)
 //   --gpu-kernel-times              time each step of the GPU loop, slower, only for testing
 //   --early-gpu-start 0|1           start the GPU while the file is read  (default 1)
+//   --incremental-worklist 0|1      next list from the vertices that got flow (default 1)
 //
 // exit codes: 0 ok, 2 cannot open, 3 missing backend, 4 solver timeout, 5 not Boolean, 6 arity too high or out of memory, 7 failure
 
@@ -158,6 +159,7 @@ static void usage(const char* prog) {
             << "  --perturb off|int|real   --spread K   --delta D   --seed S\n"
             << "  gpu: --sink-bfs 0|1 --hub-deg N --block-deg N --bfs-split 0|1 --block-threads N\n"
             << "       --async 0|1 --gr-period N --kernel-cycles N --gpu-kernel-times --early-gpu-start 0|1\n"
+            << "       --incremental-worklist 0|1\n"
             << "  see the comment at the top of apps/e2e_solve.cpp for details\n";
 }
 
@@ -188,6 +190,7 @@ static int run(int argc, char** argv) {
   int g_kernel_cycles = 0;
   bool g_kernel_times = false;
   int g_early_gpu_start = 1;
+  int g_incremental = 1;
 
   // [ARGS] read the command line
   for (int i = 1; i < argc; i++) {
@@ -213,6 +216,7 @@ static int run(int argc, char** argv) {
     else if (a == "--kernel-cycles" && has_val) g_kernel_cycles = std::atoi(argv[++i]);
     else if (a == "--gpu-kernel-times") g_kernel_times = true;
     else if (a == "--early-gpu-start" && has_val) g_early_gpu_start = std::atoi(argv[++i]);
+    else if (a == "--incremental-worklist" && has_val) g_incremental = std::atoi(argv[++i]);
     else if (a == "-h" || a == "--help") {
       usage(argv[0]);
       return 0;
@@ -293,6 +297,7 @@ static int run(int argc, char** argv) {
   gs.gr_period = g_gr_period;
   gs.kernel_cycles = g_kernel_cycles;
   gs.kernel_times = g_kernel_times;
+  gs.incremental = g_incremental;
 #endif
 
   // [TIMEOUT] message passing never stops on its own, so give it a limit
@@ -316,7 +321,7 @@ static int run(int argc, char** argv) {
     std::cout << "[info] gpu : sink_bfs=" << g_sink_bfs << " hub_deg=" << g_hub_deg << " block_deg=" << g_block_deg
               << " bfs_split=" << g_bfs_split << " block_threads=" << g_block_threads << " async=" << g_async
               << " gr_period=" << g_gr_period << " kernel_cycles=" << g_kernel_cycles << " kernel_times=" << g_kernel_times
-              << " early_gpu_start=" << g_early_gpu_start << "\n";
+              << " early_gpu_start=" << g_early_gpu_start << " incremental_worklist=" << g_incremental << "\n";
   }
   if (pcfg_base.mode != maxflow::perturb_mode::off && (kern == "lp" || kern == "none")) {
     std::cout << "[info] note : --perturb has no effect with --kernelizer " << kern << "\n";

@@ -1,5 +1,7 @@
 // push-relabel max-flow on the GPU, data driven: every pass only the active vertices get threads
 // vertices are split by degree, small ones get a thread, hubs get a warp and big ones get a block
+// the list of the next pass is collected from the vertices that got flow (incremental worklist), a full scan
+// of all vertices is only done in the first pass and after a global relabel
 // usage:
 //   gpu_config().hub_deg = 64;              optional, defaults are the tuned values
 //   gpu_worklist_solver s(net);
@@ -45,6 +47,7 @@ namespace maxflow {
     int gr_period = 75;         // passes between two global relabels
     int kernel_cycles = 0;      // push or relabel steps per vertex in one pass, 0 = |E|/|V|
     bool kernel_times = false;  // time each step of the loop, adds waits so only for testing
+    int incremental = 1;        // next list from the vertices that got flow: 0 = full scan every pass, 1 = on
   };
 
   inline gpu_settings& gpu_config() {
@@ -177,26 +180,52 @@ namespace maxflow {
   }
 
   // [LIST] active vertex = not source or sink, excess > 0 and height < |V|
-  // each active vertex goes to one of three lists by its degree, counts[0..2] are the list sizes
+  __device__ __forceinline__ bool wl_is_active(int u, int num_nodes, int source, int sink, const cap_t* excess, const int* height) {
+    return u != source && u != sink && excess[u] > MAXFLOW_EPSILON && height[u] < num_nodes;
+  }
+
+  // [LIST] an active vertex goes to one of three lists by its degree, counts[0..2] are the list sizes
+  __device__ __forceinline__ void wl_add_to_lists(int u, int hub_deg, int block_deg, const int* offset, int* worklist, int* hub_list, int* big_list, int* counts) {
+    int d = offset[u + 1] - offset[u];
+    if (block_deg > 0 && d >= block_deg) {
+      big_list[atomicAdd(&counts[2], 1)] = u;
+    } else if (hub_deg > 0 && d >= hub_deg) {
+      hub_list[atomicAdd(&counts[1], 1)] = u;
+    } else {
+      worklist[atomicAdd(&counts[0], 1)] = u;
+    }
+  }
+
+  // [LIST] full scan, one thread per vertex, used in the first pass and after a global relabel
   __global__ void wl_build_worklist_kernel(int num_nodes, int source, int sink, int hub_deg, int block_deg, const int* offset, const cap_t* excess, const int* height, int* worklist, int* hub_list, int* big_list, int* counts) {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
-    if (u >= num_nodes || u == source || u == sink) {
-      return;
+    if (u < num_nodes && wl_is_active(u, num_nodes, source, sink, excess, height)) {
+      wl_add_to_lists(u, hub_deg, block_deg, offset, worklist, hub_list, big_list, counts);
     }
-    if (excess[u] > MAXFLOW_EPSILON && height[u] < num_nodes) {
-      int d = offset[u + 1] - offset[u];
-      if (block_deg > 0 && d >= block_deg) {
-        big_list[atomicAdd(&counts[2], 1)] = u;
-      } else if (hub_deg > 0 && d >= hub_deg) {
-        hub_list[atomicAdd(&counts[1], 1)] = u;
-      } else {
-        worklist[atomicAdd(&counts[0], 1)] = u;
+  }
+
+  // [CAND] incremental worklist, v becomes a candidate of the next pass, the mark keeps it to one entry per pass
+  // cand is nullptr when the incremental worklist is off, then nothing is collected
+  __device__ __forceinline__ void wl_add_candidate(int v, int stamp, int* mark, int* cand, int* cand_count) {
+    if (cand != nullptr && atomicExch(&mark[v], stamp) != stamp) {
+      cand[atomicAdd(cand_count, 1)] = v;
+    }
+  }
+
+  // [CAND] incremental worklist, only the candidates of the last pass are tested, same test and lists as the full scan
+  // the grid is fixed, so each thread loops over its share of the candidates
+  __global__ void wl_filter_candidates_kernel(const int* cand_count, const int* cand, int num_nodes, int source, int sink, int hub_deg, int block_deg, const int* offset, const cap_t* excess, const int* height, int* worklist, int* hub_list, int* big_list, int* counts) {
+    int n = *cand_count;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+      int u = cand[i];
+      if (wl_is_active(u, num_nodes, source, sink, excess, height)) {
+        wl_add_to_lists(u, hub_deg, block_deg, offset, worklist, hub_list, big_list, counts);
       }
     }
   }
 
   // [PUSH] algorithm 2, one thread per small active vertex
-  __global__ void wl_push_relabel_kernel(int work_size, int num_nodes, int kernel_cycles, const int* worklist, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height) {
+  __global__ void wl_push_relabel_kernel(int work_size, int num_nodes, int kernel_cycles, const int* worklist, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= work_size) {
       return;
@@ -232,6 +261,7 @@ namespace maxflow {
         atomicAdd(&residual_capacity[reverse_index[e_hat]], d);
         atomicAdd(&excess[u], -d);
         atomicAdd(&excess[v_hat], d);
+        wl_add_candidate(v_hat, stamp, mark, cand, cand_count);
       } else {
         // [RELABEL] lift u just above its lowest neighbour
         height[u] = lowest_h + 1;
@@ -240,12 +270,14 @@ namespace maxflow {
   }
 
   // [REMOVE] algorithm 3, one thread per small active vertex, cancel residual on edges with h(u) > h(v) + 1
-  __global__ void wl_remove_invalid_edges_kernel(int work_size, const int* worklist, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height) {
+  // [CAND] every vertex of this pass is a candidate again (it can keep excess), and so is every v that gets flow
+  __global__ void wl_remove_invalid_edges_kernel(int work_size, const int* worklist, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= work_size) {
       return;
     }
     int u = worklist[idx];
+    wl_add_candidate(u, stamp, mark, cand, cand_count);
     for (int e = offset[u]; e < offset[u + 1]; e++) {
       int v = edge_dst[e];
       cap_t rc = residual_capacity[e];
@@ -254,12 +286,13 @@ namespace maxflow {
         atomicAdd(&residual_capacity[reverse_index[e]], rc);
         atomicAdd(&excess[u], -rc);
         atomicAdd(&excess[v], rc);
+        wl_add_candidate(v, stamp, mark, cand, cand_count);
       }
     }
   }
 
   // [PUSH-HUB] fix B, one warp per hub vertex, same rule as wl_push_relabel_kernel
-  __global__ void wl_push_relabel_hub_kernel(int hub_size, int num_nodes, int kernel_cycles, const int* hub_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height) {
+  __global__ void wl_push_relabel_hub_kernel(int hub_size, int num_nodes, int kernel_cycles, const int* hub_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
     const unsigned FULL = 0xffffffffu;
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = threadIdx.x & 31;
@@ -318,6 +351,7 @@ namespace maxflow {
           atomicAdd(&residual_capacity[reverse_index[best_e]], d);
           atomicAdd(&excess[u], -d);
           atomicAdd(&excess[v_hat], d);
+          wl_add_candidate(v_hat, stamp, mark, cand, cand_count);
         } else {
           height[u] = best_h + 1;
         }
@@ -331,13 +365,16 @@ namespace maxflow {
   }
 
   // [REMOVE-HUB] fix B, one warp per hub vertex, lanes share the edge list
-  __global__ void wl_remove_invalid_hub_kernel(int hub_size, const int* hub_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height) {
+  __global__ void wl_remove_invalid_hub_kernel(int hub_size, const int* hub_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
     int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = threadIdx.x & 31;
     if (warp >= hub_size) {
       return;
     }
     int u = hub_list[warp];
+    if (lane == 0) {
+      wl_add_candidate(u, stamp, mark, cand, cand_count);
+    }
     int hu = height[u];
     for (int e = offset[u] + lane; e < offset[u + 1]; e += 32) {
       int v = edge_dst[e];
@@ -347,12 +384,13 @@ namespace maxflow {
         atomicAdd(&residual_capacity[reverse_index[e]], rc);
         atomicAdd(&excess[u], -rc);
         atomicAdd(&excess[v], rc);
+        wl_add_candidate(v, stamp, mark, cand, cand_count);
       }
     }
   }
 
   // [PUSH-BLOCK] fix C, one block per big vertex, warps reduce with shuffles and meet in shared memory
-  __global__ void wl_push_relabel_block_kernel(int big_size, int num_nodes, int kernel_cycles, const int* big_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height) {
+  __global__ void wl_push_relabel_block_kernel(int big_size, int num_nodes, int kernel_cycles, const int* big_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
     const unsigned FULL = 0xffffffffu;
     __shared__ int s_h[32];
     __shared__ int s_e[32];
@@ -432,6 +470,7 @@ namespace maxflow {
             atomicAdd(&residual_capacity[reverse_index[best_e]], d);
             atomicAdd(&excess[u], -d);
             atomicAdd(&excess[v_hat], d);
+            wl_add_candidate(v_hat, stamp, mark, cand, cand_count);
           } else {
             height[u] = best_h + 1;
           }
@@ -446,11 +485,14 @@ namespace maxflow {
   }
 
   // [REMOVE-BLOCK] fix C, one block per big vertex, each thread sums what it removes and does one atomic at the end
-  __global__ void wl_remove_invalid_block_kernel(int big_size, const int* big_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height) {
+  __global__ void wl_remove_invalid_block_kernel(int big_size, const int* big_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
     if ((int)blockIdx.x >= big_size) {
       return;
     }
     int u = big_list[blockIdx.x];
+    if (threadIdx.x == 0) {
+      wl_add_candidate(u, stamp, mark, cand, cand_count);
+    }
     int hu = height[u];
     cap_t removed = cap_t(0);
     for (int e = offset[u] + threadIdx.x; e < offset[u + 1]; e += blockDim.x) {
@@ -460,6 +502,7 @@ namespace maxflow {
         residual_capacity[e] = cap_t(0);
         atomicAdd(&residual_capacity[reverse_index[e]], rc);
         atomicAdd(&excess[v], rc);
+        wl_add_candidate(v, stamp, mark, cand, cand_count);
         removed += rc;
       }
     }
@@ -492,8 +535,8 @@ namespace maxflow {
         dev_alloc(&d_worklist, V);
         dev_alloc(&d_counts, 3);
 
-        // [ALLOC] small pinned host buffer for the list sizes and the BFS flag, copies to it are direct
-        MAXFLOW_CUDA_CHECK(cudaMallocHost(&h_pinned, 4 * sizeof(int)));
+        // [ALLOC] small pinned host buffer for the list sizes, the BFS flag and the candidate count, copies to it are direct
+        MAXFLOW_CUDA_CHECK(cudaMallocHost(&h_pinned, 5 * sizeof(int)));
 
         // [COPY] graph to the device
         MAXFLOW_CUDA_CHECK(cudaMemcpy(d_offset, net.offset.data(), (V + 1) * sizeof(int), cudaMemcpyHostToDevice));
@@ -519,6 +562,9 @@ namespace maxflow {
         cudaFree(d_big_list);
         cudaFree(d_bfs_hub_list);
         cudaFree(d_bfs_big_list);
+        cudaFree(d_mark);
+        cudaFree(d_cand);
+        cudaFree(d_cand_count);
         cudaFreeHost(h_pinned);
       }
 
@@ -615,6 +661,16 @@ namespace maxflow {
         }
         int blocks_bfs_hub = (bfs_hub_size * 32 + threads - 1) / threads;
 
+        // [CAND] incremental worklist, the mark starts at 0 and every pass uses a new number, so no reset is needed
+        bool incremental = st.incremental != 0;
+        if (incremental) {
+          dev_alloc(&d_mark, V);
+          dev_alloc(&d_cand, V);
+          dev_alloc(&d_cand_count, 1);
+          MAXFLOW_CUDA_CHECK(cudaMemset(d_mark, 0, V * sizeof(int)));
+        }
+        int blocks_f = std::min(blocks_v, 160);  // filter loops over the candidates, so a small fixed grid is enough
+
         // [MEM] all device memory is allocated now, so this is the peak of the solve
         record_memory();
         metrics::get().keep_max("gpu.block_threads", block_threads);
@@ -655,6 +711,7 @@ namespace maxflow {
         };
 
         // [LIST] build the three lists of active vertices and read their sizes
+        long passes = 0;
         int small_size = 0;
         int hub_size = 0;
         int big_size = 0;
@@ -669,6 +726,22 @@ namespace maxflow {
           hub_size = h_pinned[1];
           big_size = h_pinned[2];
           work_size = small_size + hub_size + big_size;
+        };
+
+        // [CAND] incremental worklist, same three lists built from the candidates of the last pass only
+        long cand_sum = 0;
+        auto filter_lists = [&]() {
+          MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_counts, 0, 3 * sizeof(int)));
+          wl_filter_candidates_kernel<<<blocks_f, threads>>>(d_cand_count, d_cand, V, net.source, net.sink, hub_deg, block_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_big_list, d_counts);
+          MAXFLOW_CUDA_CHECK(cudaGetLastError());
+          MAXFLOW_CUDA_CHECK(cudaMemcpyAsync(h_pinned, d_counts, 3 * sizeof(int), cudaMemcpyDeviceToHost));
+          MAXFLOW_CUDA_CHECK(cudaMemcpyAsync(h_pinned + 4, d_cand_count, sizeof(int), cudaMemcpyDeviceToHost));
+          MAXFLOW_CUDA_CHECK(cudaStreamSynchronize(0));
+          small_size = h_pinned[0];
+          hub_size = h_pinned[1];
+          big_size = h_pinned[2];
+          work_size = small_size + hub_size + big_size;
+          cand_sum += h_pinned[4];
         };
 
         // [BFS] global relabel, one BFS level per launch until no new vertex is reached
@@ -702,14 +775,19 @@ namespace maxflow {
         };
 
         // [LOOP] each pass: build lists, maybe relabel, push-relabel, remove invalid edges
-        long passes = 0;
         long relabels = 0;
         long active_sum = 0;
         int outer_iter = 0;
         bool heights_fresh = false;
+        bool cand_ready = false;  // true when the last push and remove collected candidates and no relabel came after
         while (true) {
           t_step = now_sec();
-          build_lists();
+          if (cand_ready) {
+            filter_lists();
+          } else {
+            build_lists();
+          }
+          cand_ready = false;
           passes++;
           step_time("time.gpu.k_build");
 
@@ -738,31 +816,38 @@ namespace maxflow {
             // [COUNT] active vertices of this pass, summed over all passes
             active_sum += work_size;
 
+            // [CAND] fresh candidate list for the next pass, the pass number tells who is already in it
+            int stamp = static_cast<int>(passes);
+            if (incremental) {
+              MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_cand_count, 0, sizeof(int)));
+            }
+
             // [PUSH] one launch per list, thread, warp or block per vertex
             if (small_size > 0) {
-              wl_push_relabel_kernel<<<(small_size + threads - 1) / threads, threads>>>(small_size, V, kernel_cycles, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+              wl_push_relabel_kernel<<<(small_size + threads - 1) / threads, threads>>>(small_size, V, kernel_cycles, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             if (hub_size > 0) {
-              wl_push_relabel_hub_kernel<<<(hub_size * 32 + threads - 1) / threads, threads>>>(hub_size, V, kernel_cycles, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+              wl_push_relabel_hub_kernel<<<(hub_size * 32 + threads - 1) / threads, threads>>>(hub_size, V, kernel_cycles, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             if (big_size > 0) {
-              wl_push_relabel_block_kernel<<<big_size, block_threads>>>(big_size, V, kernel_cycles, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+              wl_push_relabel_block_kernel<<<big_size, block_threads>>>(big_size, V, kernel_cycles, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             after_launch();
             step_time("time.gpu.k_push");
 
             // [REMOVE] same three lists
             if (small_size > 0) {
-              wl_remove_invalid_edges_kernel<<<(small_size + threads - 1) / threads, threads>>>(small_size, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+              wl_remove_invalid_edges_kernel<<<(small_size + threads - 1) / threads, threads>>>(small_size, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             if (hub_size > 0) {
-              wl_remove_invalid_hub_kernel<<<(hub_size * 32 + threads - 1) / threads, threads>>>(hub_size, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+              wl_remove_invalid_hub_kernel<<<(hub_size * 32 + threads - 1) / threads, threads>>>(hub_size, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             if (big_size > 0) {
-              wl_remove_invalid_block_kernel<<<big_size, block_threads>>>(big_size, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height);
+              wl_remove_invalid_block_kernel<<<big_size, block_threads>>>(big_size, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             after_launch();
             step_time("time.gpu.k_remove");
+            cand_ready = incremental;
           }
           outer_iter++;
         }
@@ -772,6 +857,9 @@ namespace maxflow {
         metrics::get().add("gpu.relabels", relabels);
         metrics::get().add("gpu.bfs_levels", bfs_levels);
         metrics::get().add("gpu.active_sum", active_sum);
+        if (incremental) {
+          metrics::get().add("gpu.cand_sum", cand_sum);
+        }
         metrics::get().keep_max("gpu.nodes", V);
         metrics::get().keep_max("gpu.half_edges", E);
         t_solve = mark("time.gpu.solve", t_solve);
@@ -811,7 +899,10 @@ namespace maxflow {
       int* d_big_list = nullptr;
       int* d_bfs_hub_list = nullptr;
       int* d_bfs_big_list = nullptr;
-      int* h_pinned = nullptr;   // [0..2] list sizes, [3] BFS flag
+      int* d_mark = nullptr;          // incremental worklist, last pass in which the vertex was added
+      int* d_cand = nullptr;          // incremental worklist, candidates of the next pass
+      int* d_cand_count = nullptr;
+      int* h_pinned = nullptr;   // [0..2] list sizes, [3] BFS flag, [4] candidates
 
       size_t alloc_bytes = 0;
       size_t free_before = 0;

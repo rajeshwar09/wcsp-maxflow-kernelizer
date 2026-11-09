@@ -87,7 +87,7 @@ def step_of(name):
         return "push"
     if "remove_invalid" in name:
         return "remove"
-    if "worklist" in name:
+    if "worklist" in name or "candidates" in name:
         return "worklist"
     return "other"
 
