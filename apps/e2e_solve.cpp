@@ -26,6 +26,7 @@
 //   --gr-period N                   passes between global relabels        (default 75)
 //   --kernel-cycles N               push steps per vertex per pass        (default 0 = |E|/|V|)
 //   --gpu-kernel-times              time each step of the GPU loop, slower, only for testing
+//   --early-gpu-start 0|1           start the GPU while the file is read  (default 1)
 //
 // exit codes: 0 ok, 2 cannot open, 3 missing backend, 4 solver timeout, 5 not Boolean, 6 arity too high or out of memory, 7 failure
 
@@ -44,6 +45,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include "third_party/wcsp-solver/src/ConstraintCompositeGraph.h"
 #include "third_party/wcsp-solver/src/RunningTime.h"
@@ -60,6 +62,7 @@ using std::isinf;
 #include "src/integration/perturbation.h"
 
 #ifdef USE_GPU
+#include <cuda_runtime.h>
 #include "src/integration/KernelizerMaxflowGPU.h"
 #endif
 
@@ -103,6 +106,42 @@ static double host_peak_mb() {
   return ru.ru_maxrss / 1024.0;
 }
 
+#ifdef USE_GPU
+// [EARLY-GPU] creates the CUDA context in a background thread while the main thread reads the file
+// all threads of a program share the context, so the GPU solver later finds it ready
+// the destructor waits for the thread, so every way out of run() is safe
+struct early_gpu_start {
+  std::thread worker;
+  bool started = false;
+  double init_s = 0.0;
+  cudaError_t err = cudaSuccess;
+
+  void start() {
+    started = true;
+    worker = std::thread([this]() {
+      double t0 = now_sec();
+      err = cudaFree(0);
+      init_s = now_sec() - t0;
+    });
+  }
+
+  // [EARLY-GPU] wait until the context is ready, returns how long the wait took
+  double wait() {
+    double t0 = now_sec();
+    if (worker.joinable()) {
+      worker.join();
+    }
+    return now_sec() - t0;
+  }
+
+  ~early_gpu_start() {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+};
+#endif
+
 // [OUTPUT] status line, all metrics, then the exit code
 static int finish(const std::string& status, int rc, double t_all0) {
   metrics::get().set("time.total", now_sec() - t_all0);
@@ -118,7 +157,7 @@ static void usage(const char* prog) {
             << "  --max-rounds N   --max-arity N   --time-limit SEC\n"
             << "  --perturb off|int|real   --spread K   --delta D   --seed S\n"
             << "  gpu: --sink-bfs 0|1 --hub-deg N --block-deg N --bfs-split 0|1 --block-threads N\n"
-            << "       --async 0|1 --gr-period N --kernel-cycles N --gpu-kernel-times\n"
+            << "       --async 0|1 --gr-period N --kernel-cycles N --gpu-kernel-times --early-gpu-start 0|1\n"
             << "  see the comment at the top of apps/e2e_solve.cpp for details\n";
 }
 
@@ -148,6 +187,7 @@ static int run(int argc, char** argv) {
   int g_gr_period = 75;
   int g_kernel_cycles = 0;
   bool g_kernel_times = false;
+  int g_early_gpu_start = 1;
 
   // [ARGS] read the command line
   for (int i = 1; i < argc; i++) {
@@ -172,6 +212,7 @@ static int run(int argc, char** argv) {
     else if (a == "--gr-period" && has_val) g_gr_period = std::atoi(argv[++i]);
     else if (a == "--kernel-cycles" && has_val) g_kernel_cycles = std::atoi(argv[++i]);
     else if (a == "--gpu-kernel-times") g_kernel_times = true;
+    else if (a == "--early-gpu-start" && has_val) g_early_gpu_start = std::atoi(argv[++i]);
     else if (a == "-h" || a == "--help") {
       usage(argv[0]);
       return 0;
@@ -274,11 +315,20 @@ static int run(int argc, char** argv) {
   if (kern == "gpu") {
     std::cout << "[info] gpu : sink_bfs=" << g_sink_bfs << " hub_deg=" << g_hub_deg << " block_deg=" << g_block_deg
               << " bfs_split=" << g_bfs_split << " block_threads=" << g_block_threads << " async=" << g_async
-              << " gr_period=" << g_gr_period << " kernel_cycles=" << g_kernel_cycles << " kernel_times=" << g_kernel_times << "\n";
+              << " gr_period=" << g_gr_period << " kernel_cycles=" << g_kernel_cycles << " kernel_times=" << g_kernel_times
+              << " early_gpu_start=" << g_early_gpu_start << "\n";
   }
   if (pcfg_base.mode != maxflow::perturb_mode::off && (kern == "lp" || kern == "none")) {
     std::cout << "[info] note : --perturb has no effect with --kernelizer " << kern << "\n";
   }
+
+#ifdef USE_GPU
+  // [EARLY-GPU] start the GPU now, it gets ready while the file is read and the CCG is built
+  early_gpu_start early;
+  if (kern == "gpu" && g_early_gpu_start != 0) {
+    early.start();
+  }
+#endif
 
   // [PARSE] read the instance, non-Boolean instances are skipped with code 5
   std::ifstream in(path);
@@ -346,6 +396,17 @@ static int run(int argc, char** argv) {
     for (long i = 1; i <= max_rounds && prev != assignments.size(); i++) {
       prev = assignments.size();
       double k0 = now_sec();
+
+#ifdef USE_GPU
+      // [EARLY-GPU] first round waits for the start, the wait is part of the kernelization time
+      if (i == 1 && early.started) {
+        metrics::get().set("time.gpu.init_wait", early.wait());
+        metrics::get().set("time.gpu.init", early.init_s);
+        if (early.err != cudaSuccess) {
+          std::cout << "[info] early_gpu_start : " << cudaGetErrorString(early.err) << "\n";
+        }
+      }
+#endif
 
       // [KERNEL] fresh perturbation seed for every round
       maxflow::perturb_config pc = pcfg_base;

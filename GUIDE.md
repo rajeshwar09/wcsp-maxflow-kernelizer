@@ -211,6 +211,7 @@ These change the GPU solver, they only matter with `--kernelizer gpu`. The defau
 | `--gr-period N` | 75 | passes between two global relabels (BFS from the sink) |
 | `--kernel-cycles N` | 0 | push steps per vertex in one launch, 0 = edges / vertices |
 | `--gpu-kernel-times` | off | time every step of the GPU loop. It adds waits, so the total gets slower, use it only for testing |
+| `--early-gpu-start 0\|1` | 1 | start the GPU (CUDA context) in a background thread while the file is read, so it is ready when the kernelization starts |
 
 ### Output
 
@@ -258,7 +259,9 @@ Times are in seconds, memory in MB.
 | `graph.vertices_before`, `graph.edges_before` | CCG size before kernelization |
 | `kern.simplified` | variables fixed by `ccg.simplify()` before the kernelizer |
 | `time.kern.collect`, `time.kern.build_flownet`, `time.kern.maxflow`, `time.kern.classify`, `time.kern.apply` | the steps inside the max-flow kernelizer, summed over rounds |
-| `time.gpu.setup` | GPU memory and copy of the network (includes the CUDA start on the first call) |
+| `time.gpu.setup` | GPU memory and copy of the network (includes the CUDA start on the first call when `--early-gpu-start 0`) |
+| `time.gpu.init` | CUDA start in the background thread, only with `--early-gpu-start 1` (not part of the kernelization time) |
+| `time.gpu.init_wait` | how long the kernelization waited for that start, part of `time.kernelize` (about 0 when reading the file took longer) |
 | `time.gpu.solve`, `time.gpu.result` | GPU max-flow and copy of the result back |
 | `time.gpu.k_build`, `time.gpu.k_bfs`, `time.gpu.k_push`, `time.gpu.k_remove` | per step times, only with `--gpu-kernel-times` |
 | `gpu.block_threads` | threads per block used |
