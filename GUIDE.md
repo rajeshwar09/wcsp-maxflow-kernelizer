@@ -213,7 +213,6 @@ These change the GPU solver, they only matter with `--kernelizer gpu`. The defau
 | `--gpu-kernel-times` | off | time every step of the GPU loop. It adds waits, so the total gets slower, use it only for testing |
 | `--early-gpu-start 0\|1` | 1 | start the GPU (CUDA context) in a background thread while the file is read, so it is ready when the kernelization starts |
 | `--incremental-worklist 0\|1` | 1 | build the list of the next pass from the vertices that got flow instead of a scan of all vertices, 0 = scan every pass |
-| `--aggregated-atomics 0\|1\|2` | 2 | how list appends get their slot: 0 = one atomicAdd per thread, 1 = one per warp (the lanes that are there together share it), 2 = like 1, and in the two list kernels one per block, counted in shared memory first |
 
 ### Output
 
@@ -512,7 +511,7 @@ mincut_lattice is not a pass or fail test, it gives the ceiling of one instance:
 
 ## 9. The GPU solver in short
 
-The GPU solver is a push-relabel max-flow. Every pass only the active vertices (excess > 0) get threads (worklist version). The list of the next pass is collected from the vertices that got flow in this pass (incremental worklist), a scan of all vertices is only done in the first pass and after a global relabel. When a thread adds a vertex to a list, the lanes of its warp share one atomicAdd for their slots, and in the two list kernels the whole block shares one per list, counted in shared memory first (`--aggregated-atomics`). Every `--gr-period` passes a global relabel (backward BFS from the sink) sets the heights again.
+The GPU solver is a push-relabel max-flow. Every pass only the active vertices (excess > 0) get threads (worklist version). The list of the next pass is collected from the vertices that got flow in this pass (incremental worklist), a scan of all vertices is only done in the first pass and after a global relabel. Every `--gr-period` passes a global relabel (backward BFS from the sink) sets the heights again.
 
 | kernel | step |
 |---|---|
