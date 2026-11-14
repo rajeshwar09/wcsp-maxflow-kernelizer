@@ -213,6 +213,8 @@ These change the GPU solver, they only matter with `--kernelizer gpu`. The defau
 | `--gpu-kernel-times` | off | time every step of the GPU loop. It adds waits, so the total gets slower, use it only for testing |
 | `--early-gpu-start 0\|1` | 1 | start the GPU (CUDA context) in a background thread while the file is read, so it is ready when the kernelization starts |
 | `--incremental-worklist 0\|1` | 1 | build the list of the next pass from the vertices that got flow instead of a scan of all vertices, 0 = scan every pass |
+| `--passes-per-sync B` | 16 | the CPU waits for the list sizes only once every B passes, in between the kernels read the sizes from GPU memory (needs the incremental worklist), a batch never goes past a global relabel, 1 = wait after every pass |
+| `--bfs-levels-per-sync L` | 4 | in the global relabel the CPU reads the "level reached anyone" flag only every L levels, up to L - 1 empty levels run at the end, 1 = read after every level |
 
 ### Output
 
@@ -266,6 +268,8 @@ Times are in seconds, memory in MB.
 | `time.gpu.solve`, `time.gpu.result` | GPU max-flow and copy of the result back |
 | `time.gpu.k_build`, `time.gpu.k_bfs`, `time.gpu.k_push`, `time.gpu.k_remove` | per step times, only with `--gpu-kernel-times` |
 | `gpu.block_threads` | threads per block used |
+| `gpu.passes_per_sync`, `gpu.batched_passes` | the `--passes-per-sync` setting and the passes that ran without a CPU wait |
+| `gpu.bfs_levels_per_sync`, `gpu.bfs_levels_run` | the `--bfs-levels-per-sync` setting and the BFS levels launched (`gpu.bfs_levels` counts the levels up to the first empty one, as before) |
 | `gpu.cand_sum` | candidates looked at by the incremental worklist, summed over all passes (compare with `gpu.nodes` times `gpu.passes`) |
 | `gpu.passes`, `gpu.relabels`, `gpu.bfs_levels` | loop passes, global relabels and BFS levels of the GPU solver |
 | `mem.gpu_alloc_mb` | GPU memory the solver asked for with cudaMalloc |
@@ -511,7 +515,7 @@ mincut_lattice is not a pass or fail test, it gives the ceiling of one instance:
 
 ## 9. The GPU solver in short
 
-The GPU solver is a push-relabel max-flow. Every pass only the active vertices (excess > 0) get threads (worklist version). The list of the next pass is collected from the vertices that got flow in this pass (incremental worklist), a scan of all vertices is only done in the first pass and after a global relabel. Every `--gr-period` passes a global relabel (backward BFS from the sink) sets the heights again.
+The GPU solver is a push-relabel max-flow. Every pass only the active vertices (excess > 0) get threads (worklist version). The list of the next pass is collected from the vertices that got flow in this pass (incremental worklist), a scan of all vertices is only done in the first pass and after a global relabel. The CPU waits for the list sizes only every `--passes-per-sync` passes and reads the BFS flag only every `--bfs-levels-per-sync` levels, in between the kernels read the list sizes from GPU memory. Every `--gr-period` passes a global relabel (backward BFS from the sink) sets the heights again.
 
 | kernel | step |
 |---|---|

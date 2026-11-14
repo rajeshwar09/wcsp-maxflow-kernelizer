@@ -2,6 +2,8 @@
 // vertices are split by degree, small ones get a thread, hubs get a warp and big ones get a block
 // the list of the next pass is collected from the vertices that got flow (incremental worklist), a full scan
 // of all vertices is only done in the first pass and after a global relabel
+// with passes_per_sync > 1 the host waits for the list sizes only once per batch of passes, in between the kernels
+// read the sizes from GPU memory; with bfs_levels_per_sync > 1 the BFS flag is read once per batch of levels
 // usage:
 //   gpu_config().hub_deg = 64;              optional, defaults are the tuned values
 //   gpu_worklist_solver s(net);
@@ -48,6 +50,8 @@ namespace maxflow {
     int kernel_cycles = 0;      // push or relabel steps per vertex in one pass, 0 = |E|/|V|
     bool kernel_times = false;  // time each step of the loop, adds waits so only for testing
     int incremental = 1;        // next list from the vertices that got flow: 0 = full scan every pass, 1 = on
+    int passes_per_sync = 16;   // passes between two host waits for the list sizes, 1 = wait after every pass (needs incremental)
+    int bfs_levels_per_sync = 4; // BFS levels between two reads of the flag, 1 = read after every level
   };
 
   inline gpu_settings& gpu_config() {
@@ -91,6 +95,7 @@ namespace maxflow {
   }
 
   // [BFS-SINK] fix A, level 0 has only the sink, so one thread per sink edge instead of one thread for all
+  // flag = 1 = level 0 + 1, same rule as the other BFS kernels
   __global__ void gpu_bfs_sink_level_kernel(int sink_start, int sink_end, int num_nodes, const int* edge_dst, const cap_t* residual_capacity, const int* reverse_index, int* height, int* flag) {
     int e = sink_start + blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= sink_end) {
@@ -104,6 +109,7 @@ namespace maxflow {
   }
 
   // [BFS] one level, one thread per vertex, used when fix D is off
+  // [BFS] flag = level + 1 when this level reached anyone, so after several levels it tells the last level that did
   __global__ void gpu_bfs_step_kernel(int num_nodes, int level, const int* offset, const int* edge_dst, const cap_t* residual_capacity, const int* reverse_index, int* height, int* flag) {
     int u = blockIdx.x * blockDim.x + threadIdx.x;
     if (u >= num_nodes || height[u] != level) {
@@ -114,7 +120,7 @@ namespace maxflow {
       // [BFS] v reaches u when v -> u still has residual capacity
       if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
         height[v] = level + 1;
-        *flag = 1;
+        *flag = level + 1;
       }
     }
   }
@@ -135,7 +141,7 @@ namespace maxflow {
       int v = edge_dst[e];
       if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
         height[v] = level + 1;
-        *flag = 1;
+        *flag = level + 1;
       }
     }
   }
@@ -156,7 +162,7 @@ namespace maxflow {
       int v = edge_dst[e];
       if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
         height[v] = level + 1;
-        *flag = 1;
+        *flag = level + 1;
       }
     }
   }
@@ -174,7 +180,7 @@ namespace maxflow {
       int v = edge_dst[e];
       if (residual_capacity[reverse_index[e]] > MAXFLOW_EPSILON && height[v] == num_nodes) {
         height[v] = level + 1;
-        *flag = 1;
+        *flag = level + 1;
       }
     }
   }
@@ -228,14 +234,8 @@ namespace maxflow {
     }
   }
 
-  // [PUSH] algorithm 2, one thread per small active vertex
-  __global__ void wl_push_relabel_kernel(int work_size, int num_nodes, int kernel_cycles, const int* worklist, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= work_size) {
-      return;
-    }
-    int u = worklist[idx];
-
+  // [PUSH] algorithm 2, one small active vertex u, done by one thread
+  __device__ __forceinline__ void wl_push_small_vertex(int u, int num_nodes, int kernel_cycles, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
     for (int cnt = 0; cnt < kernel_cycles; cnt++) {
       if (!(height[u] < num_nodes && excess[u] > MAXFLOW_EPSILON)) {
         break;
@@ -273,14 +273,23 @@ namespace maxflow {
     }
   }
 
-  // [REMOVE] algorithm 3, one thread per small active vertex, cancel residual on edges with h(u) > h(v) + 1
-  // [CAND] every vertex of this pass is a candidate again (it can keep excess), and so is every v that gets flow
-  __global__ void wl_remove_invalid_edges_kernel(int work_size, const int* worklist, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= work_size) {
-      return;
+  // [PUSH] algorithm 2, one thread per small active vertex
+  // [BATCH] the list size comes from GPU memory when size_ptr is set (passes without a host wait), the grid can then
+  // be smaller than the list, so the kernel loops over the list; with the exact grid every loop runs once
+  // active_total sums the list sizes of the passes without a host wait on the GPU, for the metric
+  __global__ void wl_push_relabel_kernel(int work_size, const int* size_ptr, unsigned long long* active_total, int num_nodes, int kernel_cycles, const int* worklist, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
+    int n = (size_ptr != nullptr) ? size_ptr[0] : work_size;
+    if (active_total != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
+      *active_total += static_cast<unsigned long long>(size_ptr[0] + size_ptr[1] + size_ptr[2]);
     }
-    int u = worklist[idx];
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += gridDim.x * blockDim.x) {
+      wl_push_small_vertex(worklist[idx], num_nodes, kernel_cycles, offset, edge_dst, residual_capacity, reverse_index, excess, height, stamp, mark, cand, cand_count);
+    }
+  }
+
+  // [REMOVE] algorithm 3, one small active vertex u, cancel residual on edges with h(u) > h(v) + 1
+  // [CAND] every vertex of this pass is a candidate again (it can keep excess), and so is every v that gets flow
+  __device__ __forceinline__ void wl_remove_small_vertex(int u, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
     wl_add_candidate(u, stamp, mark, cand, cand_count);
     for (int e = offset[u]; e < offset[u + 1]; e++) {
       int v = edge_dst[e];
@@ -295,15 +304,19 @@ namespace maxflow {
     }
   }
 
-  // [PUSH-HUB] fix B, one warp per hub vertex, same rule as wl_push_relabel_kernel
-  __global__ void wl_push_relabel_hub_kernel(int hub_size, int num_nodes, int kernel_cycles, const int* hub_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
-    const unsigned FULL = 0xffffffffu;
-    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int lane = threadIdx.x & 31;
-    if (warp >= hub_size) {
-      return;
+  // [REMOVE] algorithm 3, one thread per small active vertex
+  // [BATCH] the list size comes from GPU memory when size_ptr is set (passes without a host wait), the grid can then
+  // be smaller than the list, so the kernel loops over the list; with the exact grid every loop runs once
+  __global__ void wl_remove_invalid_edges_kernel(int work_size, const int* size_ptr, const int* worklist, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
+    int n = (size_ptr != nullptr) ? *size_ptr : work_size;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += gridDim.x * blockDim.x) {
+      wl_remove_small_vertex(worklist[idx], offset, edge_dst, residual_capacity, reverse_index, excess, height, stamp, mark, cand, cand_count);
     }
-    int u = hub_list[warp];
+  }
+
+  // [PUSH-HUB] fix B, one hub vertex u, done by the whole warp, same rule as wl_push_small_vertex
+  __device__ __forceinline__ void wl_push_hub_vertex(int u, int lane, int num_nodes, int kernel_cycles, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
+    const unsigned FULL = 0xffffffffu;
     int start = offset[u];
     int end = offset[u + 1];
 
@@ -368,14 +381,21 @@ namespace maxflow {
     }
   }
 
-  // [REMOVE-HUB] fix B, one warp per hub vertex, lanes share the edge list
-  __global__ void wl_remove_invalid_hub_kernel(int hub_size, const int* hub_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
-    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  // [PUSH-HUB] fix B, one warp per hub vertex
+  // [BATCH] the list size comes from GPU memory when size_ptr is set (passes without a host wait), the grid can then
+  // be smaller than the list, so the kernel loops over the list; with the exact grid every loop runs once
+  // the warp index is the same for all 32 lanes, so the shuffles inside still see the full warp
+  __global__ void wl_push_relabel_hub_kernel(int hub_size, const int* size_ptr, int num_nodes, int kernel_cycles, const int* hub_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
+    int n = (size_ptr != nullptr) ? *size_ptr : hub_size;
     int lane = threadIdx.x & 31;
-    if (warp >= hub_size) {
-      return;
+    int warps_total = (gridDim.x * blockDim.x) / 32;
+    for (int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32; warp < n; warp += warps_total) {
+      wl_push_hub_vertex(hub_list[warp], lane, num_nodes, kernel_cycles, offset, edge_dst, residual_capacity, reverse_index, excess, height, stamp, mark, cand, cand_count);
     }
-    int u = hub_list[warp];
+  }
+
+  // [REMOVE-HUB] fix B, one hub vertex u, lanes share the edge list
+  __device__ __forceinline__ void wl_remove_hub_vertex(int u, int lane, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
     if (lane == 0) {
       wl_add_candidate(u, stamp, mark, cand, cand_count);
     }
@@ -393,21 +413,29 @@ namespace maxflow {
     }
   }
 
-  // [PUSH-BLOCK] fix C, one block per big vertex, warps reduce with shuffles and meet in shared memory
-  __global__ void wl_push_relabel_block_kernel(int big_size, int num_nodes, int kernel_cycles, const int* big_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
+  // [REMOVE-HUB] fix B, one warp per hub vertex
+  // [BATCH] the list size comes from GPU memory when size_ptr is set (passes without a host wait), the grid can then
+  // be smaller than the list, so the kernel loops over the list; with the exact grid every loop runs once
+  __global__ void wl_remove_invalid_hub_kernel(int hub_size, const int* size_ptr, const int* hub_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
+    int n = (size_ptr != nullptr) ? *size_ptr : hub_size;
+    int lane = threadIdx.x & 31;
+    int warps_total = (gridDim.x * blockDim.x) / 32;
+    for (int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32; warp < n; warp += warps_total) {
+      wl_remove_hub_vertex(hub_list[warp], lane, offset, edge_dst, residual_capacity, reverse_index, excess, height, stamp, mark, cand, cand_count);
+    }
+  }
+
+  // [PUSH-BLOCK] fix C, one big vertex u, done by the whole block, warps reduce with shuffles and meet in shared memory
+  __device__ __forceinline__ void wl_push_block_vertex(int u, int num_nodes, int kernel_cycles, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
     const unsigned FULL = 0xffffffffu;
     __shared__ int s_h[32];
     __shared__ int s_e[32];
     __shared__ int s_active;
     __shared__ int s_stop;
-    if ((int)blockIdx.x >= big_size) {
-      return;
-    }
     int tid = threadIdx.x;
     int lane = tid & 31;
     int wid = tid >> 5;
     int nwarps = blockDim.x >> 5;
-    int u = big_list[blockIdx.x];
     int start = offset[u];
     int end = offset[u + 1];
 
@@ -488,12 +516,21 @@ namespace maxflow {
     }
   }
 
-  // [REMOVE-BLOCK] fix C, one block per big vertex, each thread sums what it removes and does one atomic at the end
-  __global__ void wl_remove_invalid_block_kernel(int big_size, const int* big_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
-    if ((int)blockIdx.x >= big_size) {
-      return;
+  // [PUSH-BLOCK] fix C, one block per big vertex
+  // [BATCH] the list size comes from GPU memory when size_ptr is set (passes without a host wait), the grid can then
+  // be smaller than the list, so the kernel loops over the list; with the exact grid every loop runs once
+  // b is the same for the whole block, so the __syncthreads inside stay safe; the one at the top makes the block
+  // finish with the shared flags of one vertex before the next vertex writes them
+  __global__ void wl_push_relabel_block_kernel(int big_size, const int* size_ptr, int num_nodes, int kernel_cycles, const int* big_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, int* height, int stamp, int* mark, int* cand, int* cand_count) {
+    int n = (size_ptr != nullptr) ? *size_ptr : big_size;
+    for (int b = blockIdx.x; b < n; b += gridDim.x) {
+      __syncthreads();
+      wl_push_block_vertex(big_list[b], num_nodes, kernel_cycles, offset, edge_dst, residual_capacity, reverse_index, excess, height, stamp, mark, cand, cand_count);
     }
-    int u = big_list[blockIdx.x];
+  }
+
+  // [REMOVE-BLOCK] fix C, one big vertex u, each thread sums what it removes and does one atomic at the end
+  __device__ __forceinline__ void wl_remove_block_vertex(int u, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
     if (threadIdx.x == 0) {
       wl_add_candidate(u, stamp, mark, cand, cand_count);
     }
@@ -512,6 +549,16 @@ namespace maxflow {
     }
     if (removed > cap_t(0)) {
       atomicAdd(&excess[u], -removed);
+    }
+  }
+
+  // [REMOVE-BLOCK] fix C, one block per big vertex
+  // [BATCH] the list size comes from GPU memory when size_ptr is set (passes without a host wait), the grid can then
+  // be smaller than the list, so the kernel loops over the list; with the exact grid every loop runs once
+  __global__ void wl_remove_invalid_block_kernel(int big_size, const int* size_ptr, const int* big_list, const int* offset, const int* edge_dst, cap_t* residual_capacity, const int* reverse_index, cap_t* excess, const int* height, int stamp, int* mark, int* cand, int* cand_count) {
+    int n = (size_ptr != nullptr) ? *size_ptr : big_size;
+    for (int b = blockIdx.x; b < n; b += gridDim.x) {
+      wl_remove_block_vertex(big_list[b], offset, edge_dst, residual_capacity, reverse_index, excess, height, stamp, mark, cand, cand_count);
     }
   }
 
@@ -570,6 +617,7 @@ namespace maxflow {
         cudaFree(d_cand);
         cudaFree(d_cand_count);
         cudaFree(d_cand_total);
+        cudaFree(d_active_total);
         cudaFreeHost(h_pinned);
       }
 
@@ -678,9 +726,20 @@ namespace maxflow {
         }
         int blocks_f = std::min(blocks_v, 160);  // filter loops over the candidates, so a small fixed grid is enough
 
+        // [BATCH] passes between two host waits, only with the incremental worklist (the filter needs no host input)
+        int passes_per_sync = std::max(1, st.passes_per_sync);
+        bool batching = incremental && passes_per_sync > 1;
+        if (batching) {
+          dev_alloc(&d_active_total, 1);
+          MAXFLOW_CUDA_CHECK(cudaMemset(d_active_total, 0, sizeof(unsigned long long)));
+        }
+        int bfs_levels_per_sync = std::max(1, st.bfs_levels_per_sync);
+
         // [MEM] all device memory is allocated now, so this is the peak of the solve
         record_memory();
         metrics::get().keep_max("gpu.block_threads", block_threads);
+        metrics::get().keep_max("gpu.passes_per_sync", passes_per_sync);
+        metrics::get().keep_max("gpu.bfs_levels_per_sync", bfs_levels_per_sync);
 
         // [INIT] reset arrays and saturate the source edges
         gpu_initialize_kernel<<<blocks_max, threads>>>(V, E, net.source, d_capacity, d_residual_capacity, d_excess, d_height);
@@ -749,11 +808,14 @@ namespace maxflow {
         };
 
         // [BFS] global relabel, one BFS level per launch until no new vertex is reached
+        // [BFS] the flag is set to level + 1 by every level that reaches anyone and is read every bfs_levels_per_sync
+        // levels; a level after an empty one finds no vertex on it and changes nothing, so the extra levels are safe
+        // from level |V| - 2 on the flag is read after every level, so no level ever starts at height |V|
         auto global_relabel = [&]() {
           gpu_bfs_init_kernel<<<blocks_v, threads>>>(V, net.sink, d_height);
           after_launch();
+          MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_flag, 0, sizeof(int)));
           for (int level = 0; ; level++) {
-            MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_flag, 0, sizeof(int)));
             if (level == 0 && sink_bfs) {
               gpu_bfs_sink_level_kernel<<<blocks_sink, threads>>>(sink_start, sink_end, V, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
             } else if (bfs_split) {
@@ -768,11 +830,16 @@ namespace maxflow {
               gpu_bfs_step_kernel<<<blocks_v, threads>>>(V, level, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_height, d_flag);
             }
             after_launch();
-            // [BFS] one wait per level, the flag says if this level reached anyone
+            bfs_levels_run++;
+            if ((level + 1) % bfs_levels_per_sync != 0 && level + 2 < V) {
+              continue;
+            }
+            // [BFS] one wait per batch of levels, the flag says the last level that reached anyone
             MAXFLOW_CUDA_CHECK(cudaMemcpyAsync(h_pinned + 3, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
             MAXFLOW_CUDA_CHECK(cudaStreamSynchronize(0));
-            bfs_levels++;
-            if (h_pinned[3] == 0) {
+            if (h_pinned[3] != level + 1) {
+              // [BFS] levels up to the first empty one, the same count as with one wait per level
+              bfs_levels += h_pinned[3] + 1;
               break;
             }
           }
@@ -781,6 +848,7 @@ namespace maxflow {
         // [LOOP] each pass: build lists, maybe relabel, push-relabel, remove invalid edges
         long relabels = 0;
         long active_sum = 0;
+        long batched_passes = 0;
         int outer_iter = 0;
         bool heights_fresh = false;
         bool cand_ready = false;  // true when the last push and remove collected candidates and no relabel came after
@@ -828,38 +896,88 @@ namespace maxflow {
 
             // [PUSH] one launch per list, thread, warp or block per vertex
             if (small_size > 0) {
-              wl_push_relabel_kernel<<<(small_size + threads - 1) / threads, threads>>>(small_size, V, kernel_cycles, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              wl_push_relabel_kernel<<<(small_size + threads - 1) / threads, threads>>>(small_size, nullptr, nullptr, V, kernel_cycles, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             if (hub_size > 0) {
-              wl_push_relabel_hub_kernel<<<(hub_size * 32 + threads - 1) / threads, threads>>>(hub_size, V, kernel_cycles, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              wl_push_relabel_hub_kernel<<<(hub_size * 32 + threads - 1) / threads, threads>>>(hub_size, nullptr, V, kernel_cycles, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             if (big_size > 0) {
-              wl_push_relabel_block_kernel<<<big_size, block_threads>>>(big_size, V, kernel_cycles, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              wl_push_relabel_block_kernel<<<big_size, block_threads>>>(big_size, nullptr, V, kernel_cycles, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             after_launch();
             step_time("time.gpu.k_push");
 
             // [REMOVE] same three lists
             if (small_size > 0) {
-              wl_remove_invalid_edges_kernel<<<(small_size + threads - 1) / threads, threads>>>(small_size, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              wl_remove_invalid_edges_kernel<<<(small_size + threads - 1) / threads, threads>>>(small_size, nullptr, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             if (hub_size > 0) {
-              wl_remove_invalid_hub_kernel<<<(hub_size * 32 + threads - 1) / threads, threads>>>(hub_size, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              wl_remove_invalid_hub_kernel<<<(hub_size * 32 + threads - 1) / threads, threads>>>(hub_size, nullptr, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             if (big_size > 0) {
-              wl_remove_invalid_block_kernel<<<big_size, block_threads>>>(big_size, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              wl_remove_invalid_block_kernel<<<big_size, block_threads>>>(big_size, nullptr, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
             }
             after_launch();
             step_time("time.gpu.k_remove");
             cand_ready = incremental;
           }
           outer_iter++;
+
+          // [BATCH] more passes without waiting for the list sizes: filter, push and remove read the sizes from GPU memory
+          // the grids come from the sizes of the last wait with room to grow, a longer list is covered by the kernel loops
+          // the batch stops before the next global relabel, so relabels come at the same pass numbers as before
+          if (batching && cand_ready) {
+            int grid_small = std::max(1, (std::min(V, 2 * small_size) + threads - 1) / threads);
+            int grid_hub = std::max(1, (std::min(hub_capacity, 2 * hub_size) * 32 + threads - 1) / threads);
+            int grid_big = std::max(1, std::min(big_capacity, 2 * big_size));
+            for (int k = 1; k < passes_per_sync && outer_iter % gr_period != 0; k++) {
+              MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_counts, 0, 3 * sizeof(int)));
+              wl_filter_candidates_kernel<<<blocks_f, threads>>>(d_cand_count, d_cand, V, net.source, net.sink, hub_deg, block_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_big_list, d_counts, d_cand_total);
+              after_launch();
+              passes++;
+              batched_passes++;
+              step_time("time.gpu.k_build");
+
+              int stamp = static_cast<int>(passes);
+              MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_cand_count, 0, sizeof(int)));
+              wl_push_relabel_kernel<<<grid_small, threads>>>(0, d_counts, d_active_total, V, kernel_cycles, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              if (hub_deg > 0) {
+                wl_push_relabel_hub_kernel<<<grid_hub, threads>>>(0, d_counts + 1, V, kernel_cycles, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              }
+              if (block_deg > 0) {
+                wl_push_relabel_block_kernel<<<grid_big, block_threads>>>(0, d_counts + 2, V, kernel_cycles, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              }
+              after_launch();
+              step_time("time.gpu.k_push");
+
+              wl_remove_invalid_edges_kernel<<<grid_small, threads>>>(0, d_counts, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              if (hub_deg > 0) {
+                wl_remove_invalid_hub_kernel<<<grid_hub, threads>>>(0, d_counts + 1, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              }
+              if (block_deg > 0) {
+                wl_remove_invalid_block_kernel<<<grid_big, block_threads>>>(0, d_counts + 2, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, stamp, d_mark, d_cand, d_cand_count);
+              }
+              after_launch();
+              step_time("time.gpu.k_remove");
+              outer_iter++;
+              // [BATCH] the heights are not fresh any more after a pass, same as without batching
+              heights_fresh = false;
+            }
+          }
         }
 
         // [COUNT] loop counters, summed over kernelization rounds
         metrics::get().add("gpu.passes", passes);
         metrics::get().add("gpu.relabels", relabels);
         metrics::get().add("gpu.bfs_levels", bfs_levels);
+        metrics::get().add("gpu.bfs_levels_run", bfs_levels_run);
+        metrics::get().add("gpu.batched_passes", batched_passes);
+        if (batching) {
+          // [BATCH] list sizes of the passes without a wait were summed on the GPU
+          unsigned long long batch_active = 0;
+          MAXFLOW_CUDA_CHECK(cudaMemcpy(&batch_active, d_active_total, sizeof(batch_active), cudaMemcpyDeviceToHost));
+          active_sum += static_cast<long>(batch_active);
+        }
         metrics::get().add("gpu.active_sum", active_sum);
         if (incremental) {
           unsigned long long cand_total = 0;
@@ -909,11 +1027,13 @@ namespace maxflow {
       int* d_cand = nullptr;          // incremental worklist, candidates of the next pass
       int* d_cand_count = nullptr;
       unsigned long long* d_cand_total = nullptr;  // incremental worklist, candidates summed over all passes
+      unsigned long long* d_active_total = nullptr;  // [BATCH] list sizes of the passes without a host wait
       int* h_pinned = nullptr;   // [0..2] list sizes, [3] BFS flag
 
       size_t alloc_bytes = 0;
       size_t free_before = 0;
       long bfs_levels = 0;
+      long bfs_levels_run = 0;      // [BFS] levels launched, more than bfs_levels when the flag is read every few levels
 
       std::vector<cap_t> h_residual_capacity;
       std::vector<cap_t> h_excess;
