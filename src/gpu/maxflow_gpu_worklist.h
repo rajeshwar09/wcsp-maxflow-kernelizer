@@ -52,6 +52,7 @@ namespace maxflow {
     int incremental = 1;        // next list from the vertices that got flow: 0 = full scan every pass, 1 = on
     int passes_per_sync = 16;   // passes between two host waits for the list sizes, 1 = wait after every pass (needs incremental)
     int bfs_levels_per_sync = 4; // BFS levels between two reads of the flag, 1 = read after every level
+    int batch_min_grid = 1;     // batched passes: 1 = hub and big kernels get at least the blocks the GPU runs at once, 0 = at least 1 block
   };
 
   inline gpu_settings& gpu_config() {
@@ -735,11 +736,28 @@ namespace maxflow {
         }
         int bfs_levels_per_sync = std::max(1, st.bfs_levels_per_sync);
 
+        // [BATCH] smallest grid of the hub and big kernels in the batched passes: a list that was empty at the last
+        // wait can fill up inside the batch, and one block would then do all those vertices one after the other
+        // the floor is the number of blocks the GPU runs at the same time, blocks with no vertex stop at once
+        int floor_hub = 1;
+        int floor_big = 1;
+        if (batching && st.batch_min_grid != 0) {
+          int dev = 0;
+          int sms = 0;
+          int threads_per_sm = 0;
+          MAXFLOW_CUDA_CHECK(cudaGetDevice(&dev));
+          MAXFLOW_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+          MAXFLOW_CUDA_CHECK(cudaDeviceGetAttribute(&threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, dev));
+          floor_hub = std::max(1, sms * (threads_per_sm / threads));
+          floor_big = std::max(1, sms * std::max(1, threads_per_sm / block_threads));
+        }
+
         // [MEM] all device memory is allocated now, so this is the peak of the solve
         record_memory();
         metrics::get().keep_max("gpu.block_threads", block_threads);
         metrics::get().keep_max("gpu.passes_per_sync", passes_per_sync);
         metrics::get().keep_max("gpu.bfs_levels_per_sync", bfs_levels_per_sync);
+        metrics::get().keep_max("gpu.batch_floor_big", floor_big);
 
         // [INIT] reset arrays and saturate the source edges
         gpu_initialize_kernel<<<blocks_max, threads>>>(V, E, net.source, d_capacity, d_residual_capacity, d_excess, d_height);
@@ -928,8 +946,9 @@ namespace maxflow {
           // the batch stops before the next global relabel, so relabels come at the same pass numbers as before
           if (batching && cand_ready) {
             int grid_small = std::max(1, (std::min(V, 2 * small_size) + threads - 1) / threads);
-            int grid_hub = std::max(1, (std::min(hub_capacity, 2 * hub_size) * 32 + threads - 1) / threads);
-            int grid_big = std::max(1, std::min(big_capacity, 2 * big_size));
+            int hub_blocks_max = std::max(1, (hub_capacity * 32 + threads - 1) / threads);
+            int grid_hub = std::min(hub_blocks_max, std::max(floor_hub, (2 * hub_size * 32 + threads - 1) / threads));
+            int grid_big = std::min(std::max(1, big_capacity), std::max(floor_big, 2 * big_size));
             for (int k = 1; k < passes_per_sync && outer_iter % gr_period != 0; k++) {
               MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_counts, 0, 3 * sizeof(int)));
               wl_filter_candidates_kernel<<<blocks_f, threads>>>(d_cand_count, d_cand, V, net.source, net.sink, hub_deg, block_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_big_list, d_counts, d_cand_total);

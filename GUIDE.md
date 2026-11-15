@@ -215,6 +215,7 @@ These change the GPU solver, they only matter with `--kernelizer gpu`. The defau
 | `--incremental-worklist 0\|1` | 1 | build the list of the next pass from the vertices that got flow instead of a scan of all vertices, 0 = scan every pass |
 | `--passes-per-sync B` | 16 | the CPU waits for the list sizes only once every B passes, in between the kernels read the sizes from GPU memory (needs the incremental worklist), a batch never goes past a global relabel, 1 = wait after every pass |
 | `--bfs-levels-per-sync L` | 4 | in the global relabel the CPU reads the "level reached anyone" flag only every L levels, up to L - 1 empty levels run at the end, 1 = read after every level |
+| `--batch-min-grid 0\|1` | 1 | in the batched passes the hub and big kernels get at least as many blocks as the GPU runs at once (capped by the list capacity), so vertices that join an empty list inside a batch are not done one after another by a single block; 0 = at least 1 block |
 
 ### Output
 
@@ -269,6 +270,7 @@ Times are in seconds, memory in MB.
 | `time.gpu.k_build`, `time.gpu.k_bfs`, `time.gpu.k_push`, `time.gpu.k_remove` | per step times, only with `--gpu-kernel-times` |
 | `gpu.block_threads` | threads per block used |
 | `gpu.passes_per_sync`, `gpu.batched_passes` | the `--passes-per-sync` setting and the passes that ran without a CPU wait |
+| `gpu.batch_floor_big` | smallest grid of the big-vertex kernels in the batched passes (`--batch-min-grid 1`) |
 | `gpu.bfs_levels_per_sync`, `gpu.bfs_levels_run` | the `--bfs-levels-per-sync` setting and the BFS levels launched (`gpu.bfs_levels` counts the levels up to the first empty one, as before) |
 | `gpu.cand_sum` | candidates looked at by the incremental worklist, summed over all passes (compare with `gpu.nodes` times `gpu.passes`) |
 | `gpu.passes`, `gpu.relabels`, `gpu.bfs_levels` | loop passes, global relabels and BFS levels of the GPU solver |

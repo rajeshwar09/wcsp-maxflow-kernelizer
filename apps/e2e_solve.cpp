@@ -30,6 +30,7 @@
 //   --incremental-worklist 0|1      next list from the vertices that got flow (default 1)
 //   --passes-per-sync B             passes between two waits for the list sizes, 1 = every pass (default 16)
 //   --bfs-levels-per-sync L         BFS levels between two reads of the level flag, 1 = every level (default 4)
+//   --batch-min-grid 0|1            batched passes: hub and big kernels get at least the blocks the GPU runs at once (default 1)
 //
 // exit codes: 0 ok, 2 cannot open, 3 missing backend, 4 solver timeout, 5 not Boolean, 6 arity too high or out of memory, 7 failure
 
@@ -161,7 +162,7 @@ static void usage(const char* prog) {
             << "  --perturb off|int|real   --spread K   --delta D   --seed S\n"
             << "  gpu: --sink-bfs 0|1 --hub-deg N --block-deg N --bfs-split 0|1 --block-threads N\n"
             << "       --async 0|1 --gr-period N --kernel-cycles N --gpu-kernel-times --early-gpu-start 0|1\n"
-            << "       --incremental-worklist 0|1 --passes-per-sync B --bfs-levels-per-sync L\n"
+            << "       --incremental-worklist 0|1 --passes-per-sync B --bfs-levels-per-sync L --batch-min-grid 0|1\n"
             << "  see the comment at the top of apps/e2e_solve.cpp for details\n";
 }
 
@@ -195,6 +196,7 @@ static int run(int argc, char** argv) {
   int g_incremental = 1;
   int g_passes_per_sync = 16;
   int g_bfs_levels_per_sync = 4;
+  int g_batch_min_grid = 1;
 
   // [ARGS] read the command line
   for (int i = 1; i < argc; i++) {
@@ -223,6 +225,7 @@ static int run(int argc, char** argv) {
     else if (a == "--incremental-worklist" && has_val) g_incremental = std::atoi(argv[++i]);
     else if (a == "--passes-per-sync" && has_val) g_passes_per_sync = std::atoi(argv[++i]);
     else if (a == "--bfs-levels-per-sync" && has_val) g_bfs_levels_per_sync = std::atoi(argv[++i]);
+    else if (a == "--batch-min-grid" && has_val) g_batch_min_grid = std::atoi(argv[++i]);
     else if (a == "-h" || a == "--help") {
       usage(argv[0]);
       return 0;
@@ -306,6 +309,7 @@ static int run(int argc, char** argv) {
   gs.incremental = g_incremental;
   gs.passes_per_sync = g_passes_per_sync;
   gs.bfs_levels_per_sync = g_bfs_levels_per_sync;
+  gs.batch_min_grid = g_batch_min_grid;
 #endif
 
   // [TIMEOUT] message passing never stops on its own, so give it a limit
@@ -330,7 +334,8 @@ static int run(int argc, char** argv) {
               << " bfs_split=" << g_bfs_split << " block_threads=" << g_block_threads << " async=" << g_async
               << " gr_period=" << g_gr_period << " kernel_cycles=" << g_kernel_cycles << " kernel_times=" << g_kernel_times
               << " early_gpu_start=" << g_early_gpu_start << " incremental_worklist=" << g_incremental
-              << " passes_per_sync=" << g_passes_per_sync << " bfs_levels_per_sync=" << g_bfs_levels_per_sync << "\n";
+              << " passes_per_sync=" << g_passes_per_sync << " bfs_levels_per_sync=" << g_bfs_levels_per_sync
+              << " batch_min_grid=" << g_batch_min_grid << "\n";
   }
   if (pcfg_base.mode != maxflow::perturb_mode::off && (kern == "lp" || kern == "none")) {
     std::cout << "[info] note : --perturb has no effect with --kernelizer " << kern << "\n";
