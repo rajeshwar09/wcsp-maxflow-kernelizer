@@ -53,6 +53,7 @@ namespace maxflow {
     int passes_per_sync = 16;   // passes between two host waits for the list sizes, 1 = wait after every pass (needs incremental)
     int bfs_levels_per_sync = 4; // BFS levels between two reads of the flag, 1 = read after every level
     int batch_min_grid = 1;     // batched passes: 1 = hub and big kernels get at least the blocks the GPU runs at once, 0 = at least 1 block
+    int cuda_graph = 2;         // batched passes: 1 = each pass is one launch of a recorded CUDA graph, 2 = same with the small, hub and big kernels side by side, 0 = one launch per step
   };
 
   inline gpu_settings& gpu_config() {
@@ -634,6 +635,15 @@ namespace maxflow {
         cudaFree(d_stamp);
         cudaFree(d_active_total);
         cudaFreeHost(h_pinned);
+        if (pass_exec != nullptr) {
+          cudaGraphExecDestroy(pass_exec);
+        }
+        if (pass_graph != nullptr) {
+          cudaGraphDestroy(pass_graph);
+        }
+        if (graph_stream != nullptr) {
+          cudaStreamDestroy(graph_stream);
+        }
       }
 
       gpu_worklist_solver(const gpu_worklist_solver&) = delete;
@@ -811,6 +821,135 @@ namespace maxflow {
           }
         };
 
+        // [GRAPH] fix 6, one batched pass is recorded once as a CUDA graph and then started with one call instead of
+        // nine (two memsets and seven kernels); every argument of the pass stays the same from pass to pass, because
+        // the list sizes and the pass number are read from GPU memory, so only the grids can differ between batches
+        // the graph is started on the same stream as all other work, so the order of the work does not change
+        // with --gpu-kernel-times the steps are timed one by one, so the graph is not used
+        bool use_graph = batching && st.cuda_graph != 0 && !st.kernel_times;
+        long graph_launches = 0;
+        long graph_updates = 0;
+        int graph_grid[3] = {0, 0, 0};          // grids of the small, hub and big kernels in the ready graph
+        cudaGraphNode_t graph_node[3][2] = {};  // push and remove node of the small, hub and big list
+        cudaKernelNodeParams graph_param[3][2] = {};
+        auto pass_graph_launch = [&](int grid_small, int grid_hub, int grid_big) {
+          int grids[3] = {grid_small, grid_hub, grid_big};
+          if (pass_exec == nullptr) {
+            // [GRAPH] record the pass on a side stream, the launches are only written down, not run
+            // [BRANCH] with --cuda-graph 2 the hub and big kernels are recorded on two more streams that split off
+            // after the pass number kernel and join again after the push step and after the remove step, so in the
+            // graph the three push kernels (and then the three remove kernels) do not wait for each other
+            bool branches = st.cuda_graph >= 2;
+            cudaStream_t gs_hub = nullptr;
+            cudaStream_t gs_big = nullptr;
+            cudaEvent_t ev_split = nullptr;
+            cudaEvent_t ev_hub = nullptr;
+            cudaEvent_t ev_big = nullptr;
+            MAXFLOW_CUDA_CHECK(cudaStreamCreateWithFlags(&graph_stream, cudaStreamNonBlocking));
+            if (branches) {
+              MAXFLOW_CUDA_CHECK(cudaStreamCreateWithFlags(&gs_hub, cudaStreamNonBlocking));
+              MAXFLOW_CUDA_CHECK(cudaStreamCreateWithFlags(&gs_big, cudaStreamNonBlocking));
+              MAXFLOW_CUDA_CHECK(cudaEventCreateWithFlags(&ev_split, cudaEventDisableTiming));
+              MAXFLOW_CUDA_CHECK(cudaEventCreateWithFlags(&ev_hub, cudaEventDisableTiming));
+              MAXFLOW_CUDA_CHECK(cudaEventCreateWithFlags(&ev_big, cudaEventDisableTiming));
+            }
+            cudaStream_t gs = graph_stream;
+            cudaStream_t hs = branches ? gs_hub : gs;
+            cudaStream_t bs = branches ? gs_big : gs;
+            auto split = [&]() {
+              if (branches) {
+                MAXFLOW_CUDA_CHECK(cudaEventRecord(ev_split, gs));
+                MAXFLOW_CUDA_CHECK(cudaStreamWaitEvent(hs, ev_split, 0));
+                MAXFLOW_CUDA_CHECK(cudaStreamWaitEvent(bs, ev_split, 0));
+              }
+            };
+            auto join = [&]() {
+              if (branches) {
+                MAXFLOW_CUDA_CHECK(cudaEventRecord(ev_hub, hs));
+                MAXFLOW_CUDA_CHECK(cudaEventRecord(ev_big, bs));
+                MAXFLOW_CUDA_CHECK(cudaStreamWaitEvent(gs, ev_hub, 0));
+                MAXFLOW_CUDA_CHECK(cudaStreamWaitEvent(gs, ev_big, 0));
+              }
+            };
+            MAXFLOW_CUDA_CHECK(cudaStreamBeginCapture(graph_stream, cudaStreamCaptureModeThreadLocal));
+            MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_counts, 0, 3 * sizeof(int), gs));
+            wl_filter_candidates_kernel<<<blocks_f, threads, 0, gs>>>(d_cand_count, d_cand, V, net.source, net.sink, hub_deg, block_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_big_list, d_counts, d_cand_total);
+            wl_next_pass_kernel<<<1, 1, 0, gs>>>(d_cand_count, d_stamp);
+            split();
+            wl_push_relabel_kernel<<<grid_small, threads, 0, gs>>>(0, d_counts, d_active_total, V, kernel_cycles, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, d_stamp, d_mark, d_cand, d_cand_count);
+            if (hub_deg > 0) {
+              wl_push_relabel_hub_kernel<<<grid_hub, threads, 0, hs>>>(0, d_counts + 1, V, kernel_cycles, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, d_stamp, d_mark, d_cand, d_cand_count);
+            }
+            if (block_deg > 0) {
+              wl_push_relabel_block_kernel<<<grid_big, block_threads, 0, bs>>>(0, d_counts + 2, V, kernel_cycles, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, d_stamp, d_mark, d_cand, d_cand_count);
+            }
+            join();
+            split();
+            wl_remove_invalid_edges_kernel<<<grid_small, threads, 0, gs>>>(0, d_counts, d_worklist, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, d_stamp, d_mark, d_cand, d_cand_count);
+            if (hub_deg > 0) {
+              wl_remove_invalid_hub_kernel<<<grid_hub, threads, 0, hs>>>(0, d_counts + 1, d_hub_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, d_stamp, d_mark, d_cand, d_cand_count);
+            }
+            if (block_deg > 0) {
+              wl_remove_invalid_block_kernel<<<grid_big, block_threads, 0, bs>>>(0, d_counts + 2, d_big_list, d_offset, d_edge_dst, d_residual_capacity, d_reverse_index, d_excess, d_height, d_stamp, d_mark, d_cand, d_cand_count);
+            }
+            join();
+            MAXFLOW_CUDA_CHECK(cudaStreamEndCapture(graph_stream, &pass_graph));
+            MAXFLOW_CUDA_CHECK(cudaGraphInstantiate(&pass_exec, pass_graph, 0));
+            // [BRANCH] the extra streams and events were only needed to record the order, the graph keeps it by itself
+            if (branches) {
+              MAXFLOW_CUDA_CHECK(cudaEventDestroy(ev_split));
+              MAXFLOW_CUDA_CHECK(cudaEventDestroy(ev_hub));
+              MAXFLOW_CUDA_CHECK(cudaEventDestroy(ev_big));
+              MAXFLOW_CUDA_CHECK(cudaStreamDestroy(gs_hub));
+              MAXFLOW_CUDA_CHECK(cudaStreamDestroy(gs_big));
+            }
+
+            // [GRAPH] find the six push and remove nodes, their grids are the ones that change between batches
+            size_t num_nodes = 0;
+            MAXFLOW_CUDA_CHECK(cudaGraphGetNodes(pass_graph, nullptr, &num_nodes));
+            std::vector<cudaGraphNode_t> nodes(num_nodes);
+            MAXFLOW_CUDA_CHECK(cudaGraphGetNodes(pass_graph, nodes.data(), &num_nodes));
+            const void* funcs[3][2] = {{reinterpret_cast<const void*>(wl_push_relabel_kernel), reinterpret_cast<const void*>(wl_remove_invalid_edges_kernel)},
+                                       {reinterpret_cast<const void*>(wl_push_relabel_hub_kernel), reinterpret_cast<const void*>(wl_remove_invalid_hub_kernel)},
+                                       {reinterpret_cast<const void*>(wl_push_relabel_block_kernel), reinterpret_cast<const void*>(wl_remove_invalid_block_kernel)}};
+            for (cudaGraphNode_t node : nodes) {
+              cudaGraphNodeType type;
+              MAXFLOW_CUDA_CHECK(cudaGraphNodeGetType(node, &type));
+              if (type != cudaGraphNodeTypeKernel) {
+                continue;
+              }
+              cudaKernelNodeParams kp = {};
+              MAXFLOW_CUDA_CHECK(cudaGraphKernelNodeGetParams(node, &kp));
+              for (int l = 0; l < 3; l++) {
+                for (int j = 0; j < 2; j++) {
+                  if (kp.func == funcs[l][j]) {
+                    graph_node[l][j] = node;
+                    graph_param[l][j] = kp;
+                  }
+                }
+              }
+            }
+            graph_grid[0] = grid_small;
+            graph_grid[1] = grid_hub;
+            graph_grid[2] = grid_big;
+          }
+          // [GRAPH] a list whose grid differs from the ready graph gets the new grid in its push and remove node
+          // the change only acts on later launches, a launch that is already queued keeps its old grid
+          for (int l = 0; l < 3; l++) {
+            if (grids[l] == graph_grid[l] || graph_node[l][0] == nullptr) {
+              continue;
+            }
+            for (int j = 0; j < 2; j++) {
+              graph_param[l][j].gridDim = dim3(grids[l]);
+              MAXFLOW_CUDA_CHECK(cudaGraphExecKernelNodeSetParams(pass_exec, graph_node[l][j], &graph_param[l][j]));
+            }
+            graph_grid[l] = grids[l];
+            graph_updates++;
+          }
+          MAXFLOW_CUDA_CHECK(cudaGraphLaunch(pass_exec, 0));
+          graph_launches++;
+        };
+
         // [LIST] build the three lists of active vertices and read their sizes
         long passes = 0;
         int small_size = 0;
@@ -966,6 +1105,16 @@ namespace maxflow {
             int grid_hub = std::min(hub_blocks_max, std::max(floor_hub, (2 * hub_size * 32 + threads - 1) / threads));
             int grid_big = std::min(std::max(1, big_capacity), std::max(floor_big, 2 * big_size));
             for (int k = 1; k < passes_per_sync && outer_iter % gr_period != 0; k++) {
+              if (use_graph) {
+                // [GRAPH] the whole pass with one call, same steps in the same order as below
+                pass_graph_launch(grid_small, grid_hub, grid_big);
+                after_launch();
+                passes++;
+                batched_passes++;
+                outer_iter++;
+                heights_fresh = false;
+                continue;
+              }
               MAXFLOW_CUDA_CHECK(cudaMemsetAsync(d_counts, 0, 3 * sizeof(int)));
               wl_filter_candidates_kernel<<<blocks_f, threads>>>(d_cand_count, d_cand, V, net.source, net.sink, hub_deg, block_deg, d_offset, d_excess, d_height, d_worklist, d_hub_list, d_big_list, d_counts, d_cand_total);
               after_launch();
@@ -1006,6 +1155,9 @@ namespace maxflow {
         metrics::get().add("gpu.bfs_levels", bfs_levels);
         metrics::get().add("gpu.bfs_levels_run", bfs_levels_run);
         metrics::get().add("gpu.batched_passes", batched_passes);
+        metrics::get().add("gpu.graph_launches", graph_launches);
+        metrics::get().add("gpu.graph_updates", graph_updates);
+        metrics::get().keep_max("gpu.cuda_graph", use_graph ? st.cuda_graph : 0);
         if (batching) {
           // [BATCH] list sizes of the passes without a wait were summed on the GPU
           unsigned long long batch_active = 0;
@@ -1064,6 +1216,9 @@ namespace maxflow {
       int* d_stamp = nullptr;         // incremental worklist, number of the current pass, raised on the GPU
       unsigned long long* d_active_total = nullptr;  // [BATCH] list sizes of the passes without a host wait
       int* h_pinned = nullptr;   // [0..2] list sizes, [3] BFS flag
+      cudaStream_t graph_stream = nullptr;   // [GRAPH] only used to record the pass, nothing runs on it
+      cudaGraph_t pass_graph = nullptr;      // [GRAPH] one batched pass as a graph
+      cudaGraphExec_t pass_exec = nullptr;   // [GRAPH] the graph made ready to launch
 
       size_t alloc_bytes = 0;
       size_t free_before = 0;
