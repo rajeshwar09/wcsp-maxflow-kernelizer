@@ -262,7 +262,7 @@ def cmd_instance(set_name, name, plain_out, prof_out, trace, sum_tsv, ker_tsv, n
         "sync_api_s": sum(d for n, d in api if "Synchronize" in n) / 1e9,
         "sync_calls": sum(1 for n, _ in api if "Synchronize" in n),
         "memcpy_api_s": sum(d for n, d in api if n.startswith("cudaMemcpy")) / 1e9,
-        "launch_api_s": sum(d for n, d in api if n.startswith("cudaLaunchKernel")) / 1e9,
+        "launch_api_s": sum(d for n, d in api if n.startswith(("cudaLaunchKernel", "cudaGraphLaunch"))) / 1e9,
     })
     for k, v in share.items():
         row["pct_" + k] = 100.0 * v / kern_ns

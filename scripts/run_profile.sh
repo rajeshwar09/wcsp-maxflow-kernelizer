@@ -193,8 +193,8 @@ for f in "${files[@]}"; do
     continue
   fi
 
-  # [NSYS] same run under nsys, CUDA trace only
-  run_limited nsys profile --trace=cuda --sample=none --cpuctxsw=none --force-overwrite=true -o "$base" "${cmd[@]}" \
+  # [NSYS] same run under nsys, CUDA trace only, kernels inside a CUDA graph are traced one by one
+  run_limited nsys profile --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none --force-overwrite=true -o "$base" "${cmd[@]}" \
     > "$base.nsys.out" 2>&1 < /dev/null
   if [ ! -f "$base.nsys-rep" ] && [ -f "$base.qdstrm" ] && [ -n "$importer" ]; then
     "$importer" -f -i "$base.qdstrm" >> "$base.nsys.out" 2>&1 < /dev/null
