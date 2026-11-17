@@ -203,7 +203,7 @@ These change the GPU solver, they only matter with `--kernelizer gpu`. The defau
 | option | default | meaning |
 |---|---|---|
 | `--sink-bfs 0\|1` | 1 | fix A, BFS level 0 with one thread per sink edge |
-| `--hub-deg N` | 64 | fix B, one warp for every vertex with at least N edges, 0 = off |
+| `--hub-deg N` | 16 | fix B, one warp for every vertex with at least N edges, 0 = off |
 | `--block-deg N` | 1024 | fix C, one block for every vertex with at least N edges, 0 = off |
 | `--bfs-split 0\|1` | 1 | fix D, each BFS level split into small, hub and block kernels |
 | `--block-threads N` | 0 | fix D2, threads per block, 0 = chosen from the largest vertex (256, 512 or 1024) |

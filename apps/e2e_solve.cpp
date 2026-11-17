@@ -18,7 +18,7 @@
 //
 //   GPU settings, defaults are the tuned values (fixes A to E):
 //   --sink-bfs 0|1                  fix A, parallel BFS level 0           (default 1)
-//   --hub-deg N                     fix B, warp per vertex with >= N edges (default 64, 0 = off)
+//   --hub-deg N                     fix B, warp per vertex with >= N edges (default 16, 0 = off)
 //   --block-deg N                   fix C, block per vertex with >= N edges (default 1024, 0 = off)
 //   --bfs-split 0|1                 fix D, split BFS levels by degree     (default 1)
 //   --block-threads N               fix D2, threads per block             (default 0 = automatic)
@@ -187,7 +187,7 @@ static int run(int argc, char** argv) {
 
   // [ARGS] GPU settings, same defaults as gpu_settings in maxflow_gpu_worklist.h
   int g_sink_bfs = 1;
-  int g_hub_deg = 64;
+  int g_hub_deg = 16;
   int g_block_deg = 1024;
   int g_bfs_split = 1;
   int g_block_threads = 0;

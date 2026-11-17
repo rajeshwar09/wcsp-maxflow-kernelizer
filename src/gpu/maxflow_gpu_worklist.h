@@ -5,7 +5,7 @@
 // with passes_per_sync > 1 the host waits for the list sizes only once per batch of passes, in between the kernels
 // read the sizes from GPU memory; with bfs_levels_per_sync > 1 the BFS flag is read once per batch of levels
 // usage:
-//   gpu_config().hub_deg = 64;              optional, defaults are the tuned values
+//   gpu_config().hub_deg = 16;              optional, defaults are the tuned values
 //   gpu_worklist_solver s(net);
 //   cap_t f = s.solve();
 //   bool src = s.is_on_source_side(v);
@@ -41,7 +41,7 @@ namespace maxflow {
   // [SETTINGS] tuning values, set from e2e_solve flags, defaults are the values used in the report
   struct gpu_settings {
     bool sink_bfs = true;       // fix A, BFS level 0 with one thread per sink edge
-    int hub_deg = 64;           // fix B, vertices with at least this many edges get a warp, 0 = off
+    int hub_deg = 16;           // fix B, vertices with at least this many edges get a warp, 0 = off
     int block_deg = 1024;       // fix C, vertices with at least this many edges get a block, 0 = off
     bool bfs_split = true;      // fix D, BFS levels also split into thread, warp and block kernels
     int block_threads = 0;      // fix D2, threads per block for big vertices, 0 = chosen from the largest vertex
