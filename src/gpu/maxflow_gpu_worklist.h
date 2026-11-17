@@ -53,6 +53,7 @@ namespace maxflow {
     int passes_per_sync = 16;   // passes between two host waits for the list sizes, 1 = wait after every pass (needs incremental)
     int bfs_levels_per_sync = 4; // BFS levels between two reads of the flag, 1 = read after every level
     int batch_min_grid = 1;     // batched passes: 1 = hub and big kernels get at least the blocks the GPU runs at once, 0 = at least 1 block
+    int certify = 1;            // proof check of the result after every solve (bookkeeping on the GPU, nothing left that can reach the sink), 0 = off
     int cuda_graph = 2;         // batched passes: 1 = each pass is one launch of a recorded CUDA graph, 2 = same with the small, hub and big kernels side by side, 0 = one launch per step
   };
 
@@ -217,6 +218,36 @@ namespace maxflow {
   __device__ __forceinline__ void wl_add_candidate(int v, int stamp, int* mark, int* cand, int* cand_count) {
     if (cand != nullptr && atomicExch(&mark[v], stamp) != stamp) {
       cand[atomicAdd(cand_count, 1)] = v;
+    }
+  }
+
+  // [CERT] proof check, part 1, one thread per edge: the two residuals of an edge pair must add up to the two
+  // capacities (bad[0] counts the pairs that do not), and the flow on every edge is added to its head vertex
+  __global__ void gpu_certify_edges_kernel(int num_edges, const int* edge_dst, const cap_t* capacity, const cap_t* residual_capacity, const int* reverse_index, cap_t* inflow, unsigned long long* bad) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < num_edges; e += gridDim.x * blockDim.x) {
+      int r = reverse_index[e];
+      cap_t d = residual_capacity[e] + residual_capacity[r] - capacity[e] - capacity[r];
+      if (d > MAXFLOW_EPSILON || d < -MAXFLOW_EPSILON) {
+        atomicAdd(&bad[0], 1ULL);
+      }
+      cap_t f = capacity[e] - residual_capacity[e];
+      if (f != cap_t(0)) {
+        atomicAdd(&inflow[edge_dst[e]], f);
+      }
+    }
+  }
+
+  // [CERT] proof check, part 2, one thread per vertex: the excess of every vertex (the source aside) must be the flow
+  // that came in minus the flow that went out, and it must not be negative (bad[1] counts the vertices where it fails)
+  __global__ void gpu_certify_vertices_kernel(int num_nodes, int source, const cap_t* inflow, const cap_t* excess, unsigned long long* bad) {
+    for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < num_nodes; v += gridDim.x * blockDim.x) {
+      if (v == source) {
+        continue;
+      }
+      cap_t d = excess[v] - inflow[v];
+      if (d > MAXFLOW_EPSILON || d < -MAXFLOW_EPSILON || excess[v] < -MAXFLOW_EPSILON) {
+        atomicAdd(&bad[1], 1ULL);
+      }
     }
   }
 
@@ -1183,8 +1214,18 @@ namespace maxflow {
         MAXFLOW_CUDA_CHECK(cudaMemcpy(h_excess.data(), d_excess, V * sizeof(cap_t), cudaMemcpyDeviceToHost));
 
         compute_source_side();
-        mark("time.gpu.result", t_solve);
+        double t_cert = mark("time.gpu.result", t_solve);
+        certified_ = true;
+        if (st.certify != 0) {
+          certify();
+          mark("time.gpu.certify", t_cert);
+        }
         return flow;
+      }
+
+      // [CERT] false when the proof check after the last solve failed, the caller then solves again
+      bool certified() const {
+        return certified_;
       }
 
       // [CUT] true when v is on the source side of the min cut
@@ -1219,6 +1260,7 @@ namespace maxflow {
       cudaStream_t graph_stream = nullptr;   // [GRAPH] only used to record the pass, nothing runs on it
       cudaGraph_t pass_graph = nullptr;      // [GRAPH] one batched pass as a graph
       cudaGraphExec_t pass_exec = nullptr;   // [GRAPH] the graph made ready to launch
+      bool certified_ = true;                // [CERT] result of the proof check after the last solve
 
       size_t alloc_bytes = 0;
       size_t free_before = 0;
@@ -1246,6 +1288,62 @@ namespace maxflow {
         metrics::get().keep_max("mem.gpu_solver_mb", (free_before > free_b ? free_before - free_b : 0) / mb);
         metrics::get().keep_max("mem.gpu_device_used_mb", (total_b - free_b) / mb);
         metrics::get().keep_max("mem.gpu_device_total_mb", total_b / mb);
+      }
+
+      // [CERT] proof check of the final preflow: it is a maximum preflow when the bookkeeping is exact (every edge
+      // pair, every excess) and no vertex with excess, and not the source, can still reach the sink in the residual graph;
+      // the bookkeeping runs on the GPU (two arrays for the check only, counted in the memory peak), the walk back from
+      // the sink runs on the host, it only visits the vertices that can still reach the sink
+      void certify() {
+        int V = net.num_nodes;
+        int E = net.num_edges;
+        cap_t* d_inflow = nullptr;
+        unsigned long long* d_bad = nullptr;
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_inflow, V * sizeof(cap_t)));
+        MAXFLOW_CUDA_CHECK(cudaMalloc(&d_bad, 2 * sizeof(unsigned long long)));
+        MAXFLOW_CUDA_CHECK(cudaMemset(d_inflow, 0, V * sizeof(cap_t)));
+        MAXFLOW_CUDA_CHECK(cudaMemset(d_bad, 0, 2 * sizeof(unsigned long long)));
+        record_memory();
+        int threads = 256;
+        gpu_certify_edges_kernel<<<std::max(1, (E + threads - 1) / threads), threads>>>(E, d_edge_dst, d_capacity, d_residual_capacity, d_reverse_index, d_inflow, d_bad);
+        MAXFLOW_CUDA_CHECK(cudaGetLastError());
+        gpu_certify_vertices_kernel<<<std::max(1, (V + threads - 1) / threads), threads>>>(V, net.source, d_inflow, d_excess, d_bad);
+        MAXFLOW_CUDA_CHECK(cudaGetLastError());
+        unsigned long long bad[2] = {0, 0};
+        MAXFLOW_CUDA_CHECK(cudaMemcpy(bad, d_bad, sizeof(bad), cudaMemcpyDeviceToHost));
+        MAXFLOW_CUDA_CHECK(cudaFree(d_inflow));
+        MAXFLOW_CUDA_CHECK(cudaFree(d_bad));
+
+        // [CERT] walk back from the sink over residual edges, every vertex found can still send flow to the sink
+        std::vector<char> to_sink(V, 0);
+        std::vector<vertex_id_t> stack;
+        to_sink[net.sink] = 1;
+        stack.push_back(net.sink);
+        long excess_to_sink = 0;
+        while (!stack.empty()) {
+          vertex_id_t v = stack.back();
+          stack.pop_back();
+          if (v == net.source || (v != net.sink && h_excess[v] > MAXFLOW_EPSILON)) {
+            excess_to_sink++;
+          }
+          for (edge_id_t e = net.offset[v]; e < net.offset[v + 1]; e++) {
+            vertex_id_t w = net.edge_dst[e];
+            if (!to_sink[w] && h_residual_capacity[net.reverse_index[e]] > MAXFLOW_EPSILON) {
+              to_sink[w] = 1;
+              stack.push_back(w);
+            }
+          }
+        }
+
+        certified_ = bad[0] == 0 && bad[1] == 0 && excess_to_sink == 0;
+        metrics::get().add("gpu.cert_bad_pairs", static_cast<double>(bad[0]));
+        metrics::get().add("gpu.cert_bad_excess", static_cast<double>(bad[1]));
+        metrics::get().add("gpu.cert_excess_to_sink", static_cast<double>(excess_to_sink));
+        metrics::get().add("gpu.cert_failed", certified_ ? 0.0 : 1.0);
+        if (!certified_) {
+          std::cerr << "[warn] gpu max-flow failed its proof check: edge pairs " << bad[0] << ", excess " << bad[1]
+                    << ", vertices with excess that can still reach the sink " << excess_to_sink << "\n";
+        }
       }
 
       // [CUT] source side = reachable from the source and from every vertex still holding excess, same as the CPU solver

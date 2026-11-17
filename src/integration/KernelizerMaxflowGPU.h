@@ -6,7 +6,9 @@
 #ifndef MAXFLOW_KERNELIZER_MAXFLOW_GPU_H
 #define MAXFLOW_KERNELIZER_MAXFLOW_GPU_H
 
+#include <iostream>
 #include <map>
+#include <stdexcept>
 #include <vector>
 
 #include "src/gpu/maxflow_gpu_worklist.h"
@@ -48,13 +50,24 @@ namespace maxflow {
         t = mark("time.kern.build_flownet", t);
 
         // [MAXFLOW] GPU worklist solver, the source side is copied out before the solver is freed
+        // [CERT] a result that fails the proof check is never used: the max-flow is solved again from the start,
+        // after three failed tries the round stops with an error
         std::vector<char> source_side(net.num_nodes, 0);
-        {
+        for (int attempt = 1;; attempt++) {
           gpu_worklist_solver solver(net);
           solver.solve();
+          if (!solver.certified()) {
+            if (attempt >= 3) {
+              throw std::runtime_error("gpu max-flow failed its proof check 3 times");
+            }
+            metrics::get().add("gpu.cert_retries", 1);
+            std::cerr << "[warn] solving the max-flow again (try " << attempt + 1 << " of 3)\n";
+            continue;
+          }
           for (int v = 0; v < net.num_nodes; v++) {
             source_side[v] = solver.is_on_source_side(v) ? 1 : 0;
           }
+          break;
         }
         t = mark("time.kern.maxflow", t);
 

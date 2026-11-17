@@ -217,6 +217,7 @@ These change the GPU solver, they only matter with `--kernelizer gpu`. The defau
 | `--bfs-levels-per-sync L` | 4 | in the global relabel the CPU reads the "level reached anyone" flag only every L levels, up to L - 1 empty levels run at the end, 1 = read after every level |
 | `--batch-min-grid 0\|1` | 1 | in the batched passes the hub and big kernels get at least as many blocks as the GPU runs at once (capped by the list capacity), so vertices that join an empty list inside a batch are not done one after another by a single block; 0 = at least 1 block |
 | `--cuda-graph 0\|1\|2` | 2 | each batched pass (two memsets and seven kernels) is recorded once as a CUDA graph and then started with one call, the grids of the push and remove nodes are changed when they differ; 2 = the same, and the small, hub and big kernels of the push step (then of the remove step) are parallel branches of the graph, so they do not wait for each other; off with `--gpu-kernel-times`; 0 = one launch per step |
+| `--certify 0\|1` | 1 | proof check after every GPU max-flow: every edge pair and every excess must add up (checked on the GPU), and no vertex with excess can still reach the sink (walk back from the sink on the host); a result that fails is never used, the max-flow is solved again, after 3 failed tries the round stops with an error; 0 = no check |
 
 ### Output
 
@@ -273,6 +274,9 @@ Times are in seconds, memory in MB.
 | `gpu.passes_per_sync`, `gpu.batched_passes` | the `--passes-per-sync` setting and the passes that ran without a CPU wait |
 | `gpu.batch_floor_big` | smallest grid of the big-vertex kernels in the batched passes (`--batch-min-grid 1`) |
 | `gpu.cuda_graph`, `gpu.graph_launches`, `gpu.graph_updates` | graph mode used (0 when no graph ran), batched passes started as one graph launch, and grid changes of a list in the ready graph |
+| `gpu.cert_failed`, `gpu.cert_retries` | max-flow results that failed the proof check, and how often the max-flow was solved again because of it (both 0 in a healthy run) |
+| `gpu.cert_bad_pairs`, `gpu.cert_bad_excess`, `gpu.cert_excess_to_sink` | what the proof check found: edge pairs that do not add up, vertices whose excess does not add up, vertices with excess that can still reach the sink |
+| `time.gpu.certify` | time of the proof check |
 | `gpu.bfs_levels_per_sync`, `gpu.bfs_levels_run` | the `--bfs-levels-per-sync` setting and the BFS levels launched (`gpu.bfs_levels` counts the levels up to the first empty one, as before) |
 | `gpu.cand_sum` | candidates looked at by the incremental worklist, summed over all passes (compare with `gpu.nodes` times `gpu.passes`) |
 | `gpu.passes`, `gpu.relabels`, `gpu.bfs_levels` | loop passes, global relabels and BFS levels of the GPU solver |
