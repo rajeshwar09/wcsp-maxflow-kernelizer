@@ -13,6 +13,7 @@
 #define MAXFLOW_KERNELIZER_MAXFLOW_H
 
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 #include <boost/graph/adjacency_list.hpp>
@@ -36,7 +37,7 @@ namespace maxflow {
   //   left u -> right v, left v -> right u for every CCG edge (u, v), capacity INF = 1 + sum of weights
   template <class CCG>
   void build_double_cover(typename CCG::graph_t& g, const std::vector<typename boost::graph_traits<typename CCG::graph_t>::vertex_descriptor>& ccg_vertices,
-                          std::map<typename boost::graph_traits<typename CCG::graph_t>::vertex_descriptor, int>& vertex_index,
+                          std::unordered_map<typename boost::graph_traits<typename CCG::graph_t>::vertex_descriptor, int>& vertex_index,
                           const perturb_config& pcfg, flow_network<cap_t>& net) {
     using namespace boost;
     typedef typename CCG::graph_t graph_t;
@@ -127,7 +128,10 @@ namespace maxflow {
 
         // [COLLECT] give every CCG vertex an integer index, the vertex list is listS so descriptors are not integers
         std::vector<vertex_t> ccg_vertices;
-        std::map<vertex_t, int> vertex_index;
+        // [INDEX] hash map from vertex to index, a std::map lookup walks a tree of millions of nodes and was most of
+        // the flow-network build time on the big instances; the indices are the same, so the network is the same
+        std::unordered_map<vertex_t, int> vertex_index;
+        vertex_index.reserve(num_vertices(g));
         typename graph_traits<graph_t>::vertex_iterator vi, vi_end;
         for (std::tie(vi, vi_end) = vertices(g); vi != vi_end; ++vi) {
           vertex_index[*vi] = static_cast<int>(ccg_vertices.size());

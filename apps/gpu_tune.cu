@@ -27,6 +27,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -167,7 +168,8 @@ int main(int argc, char** argv) {
 
   // [FLOW] the double cover network, built once and used by every run
   std::vector<vertex_t> ccg_vertices;
-  std::map<vertex_t, int> vertex_index;
+  std::unordered_map<vertex_t, int> vertex_index;
+  vertex_index.reserve(boost::num_vertices(g));
   boost::graph_traits<graph_t>::vertex_iterator vi, vi_end;
   for (std::tie(vi, vi_end) = boost::vertices(g); vi != vi_end; ++vi) {
     vertex_index[*vi] = static_cast<int>(ccg_vertices.size());

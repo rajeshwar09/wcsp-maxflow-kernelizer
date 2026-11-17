@@ -8,6 +8,7 @@
 
 #include <iostream>
 #include <map>
+#include <unordered_map>
 #include <stdexcept>
 #include <vector>
 
@@ -32,7 +33,10 @@ namespace maxflow {
 
         // [COLLECT] integer index for every CCG vertex
         std::vector<vertex_t> ccg_vertices;
-        std::map<vertex_t, int> vertex_index;
+        // [INDEX] hash map from vertex to index, a std::map lookup walks a tree of millions of nodes and was most of
+        // the flow-network build time on the big instances; the indices are the same, so the network is the same
+        std::unordered_map<vertex_t, int> vertex_index;
+        vertex_index.reserve(num_vertices(g));
         typename graph_traits<graph_t>::vertex_iterator vi, vi_end;
         for (std::tie(vi, vi_end) = vertices(g); vi != vi_end; ++vi) {
           vertex_index[*vi] = static_cast<int>(ccg_vertices.size());
