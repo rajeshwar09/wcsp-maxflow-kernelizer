@@ -69,8 +69,10 @@ namespace maxflow {
     }
 
     // [DOUBLE-COVER] source and sink edges, one pair per CCG vertex
+    // [RESERVE] exact size, 2 per CCG vertex and 2 per CCG edge; 6n was too small when the CCG has more than 2n edges
+    // (test2, WCNF, the PackupWeighted family) and the list then grew by copying itself
     std::vector<edge<cap_t>> flow_edges;
-    flow_edges.reserve(6 * n);
+    flow_edges.reserve(2 * static_cast<std::size_t>(n) + 2 * num_edges(g));
     for (int i = 0; i < n; i++) {
       flow_edges.push_back({flow_source, i + 1, weights[i]});
       flow_edges.push_back({n + i + 1, flow_sink, weights[i]});

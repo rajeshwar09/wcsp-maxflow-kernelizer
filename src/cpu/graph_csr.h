@@ -75,8 +75,9 @@ namespace maxflow {
           reverse_index[r] = f;
         }
 
-        // [CSR-BUILD] step 4, residual starts equal to the capacity, one straight copy instead of scattered writes
-        residual_capacity = capacity;
+        // [RESIDUAL] not filled here: the CPU solver sets residual = capacity at the start of solve() and the GPU solver
+        // keeps its own residual on the GPU, so a copy here only cost time and memory on the GPU path
+        residual_capacity.clear();
       }
   };
 

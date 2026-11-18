@@ -87,10 +87,9 @@ namespace maxflow {
       }
 
       // [INIT] algorithm 1, residual = capacity, excess and height = 0, source height = |V|
+      // [RESIDUAL] the CSR build leaves residual empty, it is made here as one copy of capacity
       void initialize() {
-        for (edge_id_t e = 0; e < net.num_edges; e++) {
-          net.residual_capacity[e] = net.capacity[e];
-        }
+        net.residual_capacity = net.capacity;
         std::fill(excess.begin(), excess.end(), cap_t(0));
         std::fill(height.begin(), height.end(), 0);
         height[net.source] = net.num_nodes;
